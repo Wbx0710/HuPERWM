@@ -74,6 +74,8 @@ class BeliefWMConfig:
     detach_belief_for_frame_phone: bool = False
     belief_grad_scale: float = 0.1
     frame_phone_dropout: float = 0.1
+    # --- Canonical head regularisation ---
+    canonical_head_dropout: float = 0.0
     # --- JEPA configuration (Plan C) ---
     jepa_encoder_layers: int = 6
     jepa_encoder_heads: int = 8
@@ -536,6 +538,7 @@ class BeliefWorldModel(nn.Module):
             nn.Linear(H, config.phone_vocab_size),
         )
         self.canonical_head = nn.Linear(H, config.phone_vocab_size)
+        self._canonical_head_dropout = getattr(config, "canonical_head_dropout", 0.0)
         self.evidence_phone_head = nn.Linear(H, config.phone_vocab_size)
 
         future_in = H

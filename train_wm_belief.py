@@ -16,6 +16,7 @@ Usage (overfit on smoke data):
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import lightning.pytorch as pl
@@ -35,7 +36,7 @@ from wm_core import (
     compute_ctc_loss,
     evaluate_belief_wm,
 )
-from wm_jepa import check_collapse, compute_jepa_loss
+from wm_jepa import check_collapse, compute_jepa_loss, compute_sigreg_loss, compute_vicreg_loss
 from wm_online_data import OnlineLibriSpeechWMDataset
 from wm_teacher import load_teacher_phone_cache
 
@@ -124,11 +125,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--jepa-prior-layers", type=int, default=2)
     p.add_argument("--jepa-prior-heads", type=int, default=8)
     p.add_argument("--jepa-ema-tau", type=float, default=0.996)
+    p.add_argument(
+        "--jepa-ema-tau-end", type=float, default=None,
+        help="End value for EMA tau cosine schedule (e.g. 0.9999, like Stage 1). "
+             "None = keep tau fixed at --jepa-ema-tau throughout Stage 2.",
+    )
+    p.add_argument(
+        "--jepa-predictor-lr-mult", type=float, default=1.0,
+        help="LR multiplier for JEPA predictor parameters relative to the rest of "
+             "the model (e.g. 2.0, matching Stage 1 default). 1.0 = no difference.",
+    )
     p.add_argument("--jepa-mask-ratio", type=float, default=0.5)
     p.add_argument("--jepa-mask-min-span", type=int, default=1)
     p.add_argument("--jepa-mask-max-span", type=int, default=None)
     p.add_argument("--jepa-aux-weight", type=float, default=0.1,
                    help="Weight for JEPA auxiliary loss during Stage 2.")
+    p.add_argument("--vicreg-weight", type=float, default=0.0,
+                   help="Weight for VICReg variance+covariance regularization on online encoder "
+                        "output (prevents representation collapse; 0.01 recommended for Stage 2).")
+    p.add_argument("--vicreg-var-gamma", type=float, default=1.0,
+                   help="Target std per dimension for VICReg variance hinge (default 1.0).")
+    p.add_argument("--sigreg-weight", type=float, default=0.0,
+                   help="Weight for SIGReg (Sketched-Isotropic-Gaussian Regularizer) on online "
+                        "encoder beliefs. Alternative to VICReg; 0.05 recommended.")
+    p.add_argument("--sigreg-projections", type=int, default=64,
+                   help="Number of random projection directions for SIGReg (default 64).")
+    p.add_argument("--canonical-head-dropout", type=float, default=0.0,
+                   help="Input dropout rate for the canonical CTC head (default 0.0).")
     p.add_argument("--stage1-checkpoint", type=str, default=None,
                    help="Path to Stage 1 JEPA checkpoint to initialise from.")
 
@@ -373,18 +396,32 @@ class BeliefWMLitModule(pl.LightningModule):
                 + self.args.tts_dur_weight * tts_losses["tts_dur_loss"]
             )
 
-        # --- Belief temporal diversity loss (hinge: only penalize cosine > threshold) ---
+        # --- Belief temporal diversity loss ---
+        # Always compute adjacent cosine for real-time oscillation monitoring,
+        # regardless of whether diversity_weight > 0.
         div_weight = getattr(self.args, "diversity_weight", 0.0)
-        if div_weight > 0 and outputs["beliefs"].shape[1] > 1:
+        if outputs["beliefs"].shape[1] > 1:
             beliefs = outputs["beliefs"]
             b_prev = F.normalize(beliefs[:, :-1], dim=-1)
             b_next = F.normalize(beliefs[:, 1:], dim=-1)
             adj_mask = sm[:, 1:]
-            cos_sim = (b_prev * b_next).sum(dim=-1)
-            hinge = getattr(self.args, "diversity_hinge", 0.8)
-            diversity_loss = (F.relu(cos_sim - hinge) * adj_mask).sum() / adj_mask.sum().clamp_min(1.0)
-            loss_dict["diversity_loss"] = diversity_loss
-            loss_dict["loss"] = loss_dict["loss"] + div_weight * diversity_loss
+            cos_sim = (b_prev * b_next).sum(dim=-1)  # (B, K-1)
+            # Log mean adjacent cosine so oscillation (cos → -1) is visible in
+            # training metrics without waiting for the full PER evaluation.
+            mean_cos = (cos_sim * adj_mask).sum() / adj_mask.sum().clamp_min(1.0)
+            loss_dict["belief_mean_cosine"] = mean_cos
+            if div_weight > 0:
+                hinge = getattr(self.args, "diversity_hinge", 0.8)
+                # FIX: use abs(cos_sim) to penalise *both* over-similar beliefs
+                # (cos > +hinge) AND oscillating anti-correlated beliefs
+                # (cos < -hinge).  The original one-sided relu(cos - hinge)
+                # created a zero-loss loophole at cos ≈ -1, causing the model
+                # to learn pathologically alternating adjacent belief vectors.
+                diversity_loss = (
+                    F.relu(cos_sim.abs() - hinge) * adj_mask
+                ).sum() / adj_mask.sum().clamp_min(1.0)
+                loss_dict["diversity_loss"] = diversity_loss
+                loss_dict["loss"] = loss_dict["loss"] + div_weight * diversity_loss
 
         # --- JEPA auxiliary loss (Stage 2) ---
         jepa_weight = getattr(self.args, "jepa_aux_weight", 0.0)
@@ -396,7 +433,38 @@ class BeliefWMLitModule(pl.LightningModule):
             loss_dict["jepa_loss"] = jepa_loss
             loss_dict["loss"] = loss_dict["loss"] + jepa_weight * jepa_loss
 
+        # --- VICReg regularization (Stage 2) ---
+        # VICReg: variance + covariance regularization to prevent collapse.
+        vicreg_weight = getattr(self.args, "vicreg_weight", 0.0)
+        if self._use_jepa and vicreg_weight > 0:
+            vicreg_gamma = getattr(self.args, "vicreg_var_gamma", 1.0)
+            vicreg_target = (
+                outputs["z_pred"] if "z_pred" in outputs else outputs.get("beliefs")
+            )
+            if vicreg_target is not None:
+                var_loss, cov_loss = compute_vicreg_loss(
+                    vicreg_target, outputs["slot_mask"], gamma=vicreg_gamma
+                )
+                vicreg_loss = var_loss + cov_loss
+                loss_dict["vicreg_loss"] = vicreg_loss
+                loss_dict["loss"] = loss_dict["loss"] + vicreg_weight * vicreg_loss
+
+        # SIGReg (Maes et al., LeWM 2026): alternative to VICReg via Epps-Pulley test.
+        sigreg_weight = getattr(self.args, "sigreg_weight", 0.0)
+        if self._use_jepa and sigreg_weight > 0:
+            sigreg_n = getattr(self.args, "sigreg_projections", 64)
+            sigreg_target = (
+                outputs["z_pred"] if "z_pred" in outputs else outputs.get("beliefs")
+            )
+            if sigreg_target is not None:
+                sigreg_loss = compute_sigreg_loss(
+                    sigreg_target, outputs["slot_mask"], n_projections=sigreg_n
+                )
+                loss_dict["sigreg_loss"] = sigreg_loss
+                loss_dict["loss"] = loss_dict["loss"] + sigreg_weight * sigreg_loss
+
         return loss_dict
+
 
     def training_step(self, batch, batch_idx):
         if self._use_jepa:
@@ -424,7 +492,20 @@ class BeliefWMLitModule(pl.LightningModule):
         opt.zero_grad()
         sch.step()
 
-        self.model.update_ema()
+        # EMA tau schedule: cosine anneal from jepa_ema_tau → jepa_ema_tau_end,
+        # matching Stage 1 behaviour.  A rising tau progressively stabilises the
+        # target encoder (longer half-life), making JEPA prediction easier as
+        # training matures — the key fix for the Stage-2 JEPA-loss plateau.
+        tau_end = getattr(self.args, "jepa_ema_tau_end", None)
+        if tau_end is not None:
+            total = self.trainer.estimated_stepping_batches
+            tau_s = self.args.jepa_ema_tau
+            progress = min(1.0, self.global_step / max(total, 1))
+            tau = tau_s + (tau_end - tau_s) * (1.0 - math.cos(math.pi * progress)) / 2.0
+            self.model.update_ema(tau=tau)
+            self.log("ema_tau", tau, on_step=True, sync_dist=True)
+        else:
+            self.model.update_ema()
 
         for k, v in losses.items():
             self.log(f"train_{k}", v, on_step=True, on_epoch=True,
@@ -432,6 +513,7 @@ class BeliefWMLitModule(pl.LightningModule):
         if "z_pred" in outputs:
             std_val = check_collapse(outputs["z_pred"])
             self.log("predictor_std", std_val, on_step=True, sync_dist=True)
+
 
     def validation_step(self, batch, batch_idx):
         outputs = self._model_forward(batch)
@@ -442,12 +524,36 @@ class BeliefWMLitModule(pl.LightningModule):
     def configure_optimizers(self):
         import math as _math
 
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if self.tts_decoder is not None:
-            params += list(self.tts_decoder.parameters())
         betas = (0.8, 0.99) if self._use_jepa else (0.9, 0.999)
+        predictor_lr_mult = getattr(self.args, "jepa_predictor_lr_mult", 1.0)
+
+        # When using JEPA with predictor_lr_mult > 1, give the predictor a
+        # separate, higher-LR param group (matching Stage 1 design).
+        if self._use_jepa and predictor_lr_mult != 1.0:
+            predictor_params_set = set(
+                self.model.jepa_predictor.parameters()
+            )
+            main_params = [
+                p for p in self.model.parameters()
+                if p.requires_grad and p not in predictor_params_set
+            ]
+            pred_params = [
+                p for p in predictor_params_set if p.requires_grad
+            ]
+            if self.tts_decoder is not None:
+                main_params += list(self.tts_decoder.parameters())
+            param_groups = [
+                {"params": main_params},
+                {"params": pred_params, "lr": self.args.lr * predictor_lr_mult},
+            ]
+        else:
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            if self.tts_decoder is not None:
+                params += list(self.tts_decoder.parameters())
+            param_groups = [{"params": params}]
+
         opt = AdamW(
-            params,
+            param_groups,
             lr=self.args.lr,
             betas=betas,
             weight_decay=self.args.weight_decay,
@@ -463,7 +569,9 @@ class BeliefWMLitModule(pl.LightningModule):
             cosine = 0.5 * (1.0 + _math.cos(_math.pi * progress))
             return max(min_lr_ratio, min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        # One lambda per param group (predictor group inherits scaled base lr)
+        n_groups = len(opt.param_groups)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, [lr_lambda] * n_groups)
         return [opt], [{"scheduler": sched, "interval": "step", "frequency": 1}]
 
 
@@ -630,6 +738,7 @@ def main() -> None:
         detach_belief_for_frame_phone=False,
         belief_grad_scale=args.belief_grad_scale,
         frame_phone_dropout=args.frame_phone_dropout,
+        canonical_head_dropout=getattr(args, "canonical_head_dropout", 0.0),
         jepa_encoder_layers=args.jepa_encoder_layers,
         jepa_encoder_heads=args.jepa_encoder_heads,
         jepa_encoder_ff_dim=args.jepa_encoder_ff_dim,

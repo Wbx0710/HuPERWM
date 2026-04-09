@@ -111,15 +111,17 @@ python "${WORK_DIR}/train_wm_belief.py" \
   --jepa-prior-heads 8 \
   --jepa-mask-ratio 0.5 \
   --jepa-ema-tau 0.996 \
-  --jepa-aux-weight 0.1 \
+  --jepa-ema-tau-end 0.9999 \
+  --jepa-predictor-lr-mult 2.0 \
+  --jepa-aux-weight 0.3 \
+  --vicreg-weight 0.01 \
+  --vicreg-var-gamma 1.0 \
   --frame-phone-weight 1.0 \
   --evidence-phone-weight 0.5 \
   --canonical-weight 0.5 \
   --future-weight 0.3 \
   --recon-weight 0.3 \
-  --diversity-weight 0.1 \
-  --diversity-hinge 0.8 \
-  --belief-grad-scale 0.1 \
+  --belief-grad-scale 0.0 \
   --frame-phone-dropout 0.1 \
   --batch-size 64 \
   --eval-batch-size 64 \

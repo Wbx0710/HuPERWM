@@ -537,6 +537,56 @@ def update_ema(
 
 
 @torch.no_grad()
+def compute_sigreg_loss(
+    z: torch.Tensor,
+    slot_mask: torch.Tensor,
+    n_projections: int = 64,
+    n_t: int = 32,
+) -> torch.Tensor:
+    """SIGReg — Sketched-Isotropic-Gaussian Regularizer (Maes et al., LeWM 2026).
+
+    Projects embeddings onto M random directions and minimises the Epps-Pulley
+    test statistic along each 1-D projection to enforce an isotropic Gaussian
+    latent distribution.  Replaces VICReg: single hyperparameter (weight λ),
+    provable anti-collapse guarantee, smoother convergence.
+
+    Args:
+        z:            (B, K, H) — beliefs or predictor output.
+        slot_mask:    (B, K) float — 1 for valid slots.
+        n_projections: M random projection directions (default 64).
+        n_t:          K evaluation points for the characteristic function (default 32).
+
+    Returns:
+        Scalar regularisation loss.
+    """
+    mask = slot_mask > 0.5
+    z_flat = z[mask].float()          # (N, H)
+    N, H = z_flat.shape
+    if N < 4:
+        return z_flat.new_zeros(())
+
+    # --- random projections (new directions each forward pass for stochasticity) ---
+    u = F.normalize(
+        torch.randn(H, n_projections, device=z_flat.device, dtype=z_flat.dtype), dim=0
+    )                                  # (H, M)
+    h = z_flat @ u                     # (N, M)
+
+    # standardise each projection → compare against N(0,1) target
+    h = (h - h.mean(0)) / h.std(0).clamp(min=1e-6)   # (N, M)
+
+    # Epps-Pulley: compare empirical CF to Gaussian CF at t grid
+    # CF_N(0,1)(t) = exp(-t²/2)  [purely real, zero imaginary part]
+    t = torch.linspace(0.5, 3.0, n_t, device=z_flat.device, dtype=z_flat.dtype)  # (K,)
+
+    # h: (N, M) → unsqueeze for broadcasting with t: (K,)
+    th = h.unsqueeze(-1) * t           # (N, M, K)
+    ecf_real = th.cos().mean(0)        # (M, K)  — real part of empirical CF
+    ecf_imag = th.sin().mean(0)        # (M, K)  — imaginary part
+    gcf = (-0.5 * t.pow(2)).exp()      # (K,)    — Gaussian CF (real)
+
+    return ((ecf_real - gcf) ** 2 + ecf_imag ** 2).mean()
+
+
 def check_collapse(z_pred: torch.Tensor, threshold: float = 0.01) -> float:
     """Returns mean std of predictor output across batch and slot dims.
 
