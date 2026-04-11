@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--device", type=str, default="cuda")
+    # --- Agent evaluation ---
+    p.add_argument("--agent-checkpoint", type=str, default=None,
+                   help="Path to agent checkpoint (il_best.pt or ppo_best.pt) for "
+                        "agent-in-the-loop evaluation.")
+    p.add_argument("--agent-data-dir", type=str, default=None,
+                   help="Pre-extracted agent data dir.  If not set, agent eval is skipped.")
     return p.parse_args()
 
 
@@ -177,9 +183,34 @@ def main() -> None:
     print(f"Model belief_type: {belief_type}")
 
     metrics = evaluate_belief_wm(model, loader, phone_vocab, device)
+
+    # --- Agent-in-the-loop evaluation ---
+    agent_metrics = {}
+    if args.agent_checkpoint and args.agent_data_dir:
+        try:
+            from wm_agent import AgentConfig, EnvConfig, SchedulerAgent
+            from wm_agent_data import AgentDataset
+            from train_wm_agent import evaluate_agent
+
+            agent_ckpt = torch.load(args.agent_checkpoint, map_location="cpu", weights_only=False)
+            agent_cfg = agent_ckpt.get("agent_config", AgentConfig())
+            agent = SchedulerAgent(agent_cfg).to(device)
+            agent.load_state_dict(agent_ckpt["agent_state_dict"])
+
+            agent_ds = AgentDataset(args.agent_data_dir, args.split)
+            env_cfg = agent_ckpt.get("env_config", EnvConfig())
+            agent_metrics = evaluate_agent(
+                agent, agent_ds, phone_vocab, device, env_cfg,
+                max_episodes=min(500, len(agent_ds)),
+            )
+            agent_metrics = {f"agent_{k}": v for k, v in agent_metrics.items()}
+            print(f"Agent evaluation: {json.dumps(agent_metrics, indent=2)}")
+        except Exception as e:
+            print(f"Agent evaluation failed: {e}")
+
     full_metrics = {
         "split": args.split, "checkpoint": args.checkpoint,
-        "belief_type": belief_type, **metrics,
+        "belief_type": belief_type, **metrics, **agent_metrics,
     }
 
     write_json(output_dir / "metrics.json", full_metrics)

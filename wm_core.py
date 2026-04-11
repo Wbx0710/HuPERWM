@@ -549,6 +549,35 @@ class BeliefWorldModel(nn.Module):
         )
         self.recon_head = nn.Linear(H, H)
 
+    # ---- agent-facing inference ---------------------------------------------
+
+    @torch.no_grad()
+    def extract_slot_features(
+        self,
+        evidence: torch.Tensor,
+        boundaries: torch.Tensor,
+        slot_mask: torch.Tensor,
+        num_frames: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Frozen inference returning per-slot beliefs, priors, and CTC logits.
+
+        Used by the RL scheduler agent environment.  No JEPA masking or
+        training-only heads are computed.
+        """
+        out = self.forward(
+            evidence, boundaries, slot_mask, num_frames,
+            frame_mask=frame_mask, compute_jepa_loss=False,
+        )
+        return {
+            "slots": out["slots"],
+            "beliefs": out["beliefs"],
+            "priors": out["priors"],
+            "slot_mask": out["slot_mask"],
+            "canonical_logits": out["canonical_logits"],
+            "up_slot_mask": out["up_slot_mask"],
+        }
+
     # ---- helpers -----------------------------------------------------------
 
     def _pool(
