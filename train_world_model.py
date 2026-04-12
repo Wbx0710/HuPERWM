@@ -25,18 +25,18 @@ from lightning.pytorch.loggers import CSVLogger
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from huperjepa.data.vocab import Vocabulary, write_json
-from huperjepa.data.world_model import (
+from huperwm.data.vocab import Vocabulary, write_json
+from huperwm.data.world_model import (
     BeliefWMCollator,
     BeliefWMDataset,
     compute_ctc_loss,
     evaluate_belief_wm,
 )
-from huperjepa.data.online import OnlineLibriSpeechWMDataset
-from huperjepa.model.conformer import compute_sigreg_loss
-from huperjepa.model.encoder import convergence_loss
-from huperjepa.model.world_model import BeliefWorldModel, WorldModelConfig
-from huperjepa.teacher import load_teacher_phone_cache
+from huperwm.data.online import OnlineLibriSpeechWMDataset
+from huperwm.model.conformer import compute_sigreg_loss
+from huperwm.model.encoder import convergence_loss
+from huperwm.model.world_model import BeliefWorldModel, WorldModelConfig
+from huperwm.teacher import load_teacher_phone_cache
 
 
 def _maybe_teacher_cache(args) -> dict | None:

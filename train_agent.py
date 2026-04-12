@@ -32,14 +32,14 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from huperjepa.data.vocab import Vocabulary
-from huperjepa.data.agent import AgentCollator, AgentDataset
-from huperjepa.env.asr import (
+from huperwm.data.vocab import Vocabulary
+from huperwm.data.agent import AgentCollator, AgentDataset
+from huperwm.env.asr import (
     EMIT, WAIT,
     ASRSchedulerEnv, EnvConfig, EpisodeBuffer, Transition,
     collect_episode, collect_episodes_batched, grpo_update,
 )
-from huperjepa.model.agent import ActiveAgent, ActiveAgentConfig
+from huperwm.model.agent import ActiveAgent, ActiveAgentConfig
 
 
 # ---------------------------------------------------------------------------

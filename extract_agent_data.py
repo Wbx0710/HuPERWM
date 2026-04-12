@@ -18,10 +18,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from huperjepa.data.vocab import Vocabulary
-from huperjepa.data.world_model import BeliefWMCollator, BeliefWMDataset
-from huperjepa.data.agent import extract_agent_features
-from huperjepa.model.world_model import BeliefWorldModel, WorldModelConfig
+from huperwm.data.vocab import Vocabulary
+from huperwm.data.world_model import BeliefWMCollator, BeliefWMDataset
+from huperwm.data.agent import extract_agent_features
+from huperwm.model.world_model import BeliefWorldModel, WorldModelConfig
 
 
 def parse_args() -> argparse.Namespace:
