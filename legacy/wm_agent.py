@@ -205,6 +205,133 @@ class SchedulerAgent(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# ActiveAgent (HuperJEPA v3 — comparison-gated dual-pathway)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ActiveAgentConfig:
+    """Config for the v3 ActiveAgent with dual-pathway comparison gating."""
+    belief_dim: int = 256
+    syl_feat_dim: int = 3
+    agent_hidden: int = 128
+    gru_layers: int = 1
+    dropout: float = 0.1
+
+
+class ActiveAgent(nn.Module):
+    """Comparison-gated dual-pathway agent for streaming word emission.
+
+    B-path (top-down): projects refined beliefs into a hypothesis state.
+    C-path (bottom-up): accumulates causal priors + timing features via GRU.
+    Comparison gate: error signal blends the two pathways — low error trusts
+    the hypothesis (ready to emit), high error trusts bottom-up (keep waiting).
+    """
+
+    def __init__(self, cfg: ActiveAgentConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        H = cfg.belief_dim
+        D = cfg.agent_hidden
+
+        self.hypothesis_proj = nn.Sequential(
+            nn.Linear(H, D),
+            nn.LayerNorm(D),
+            nn.GELU(),
+        )
+
+        self.evidence_encoder = nn.Sequential(
+            nn.Linear(H + cfg.syl_feat_dim, D),
+            nn.LayerNorm(D),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+        )
+        self.evidence_gru = nn.GRU(
+            D, D, num_layers=cfg.gru_layers, batch_first=True,
+        )
+
+        self.comparison_gate = nn.Sequential(
+            nn.Linear(1, D // 4),
+            nn.GELU(),
+            nn.Linear(D // 4, D),
+            nn.Sigmoid(),
+        )
+
+        self.policy_head = nn.Linear(D, 2)
+        self.value_head = nn.Linear(D, 1)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.zeros_(self.policy_head.bias)
+        nn.init.orthogonal_(self.policy_head.weight, gain=0.01)
+        nn.init.zeros_(self.value_head.bias)
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+
+    def forward(
+        self,
+        belief: torch.Tensor,
+        prior: torch.Tensor,
+        syl_feat: torch.Tensor,
+        error: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            belief:   (B, [T,] H) — refined hypothesis from ComparisonRefinement.
+            prior:    (B, [T,] H) — causal streaming prior.
+            syl_feat: (B, [T,] 3) — timing features.
+            error:    (B, [T,] 1) — comparison convergence signal.
+            hidden:   (gru_layers, B, D) or None.
+
+        Returns:
+            logits: (B, [T,] 2), value: (B, [T,] 1), hidden.
+        """
+        squeeze = belief.dim() == 2
+        if squeeze:
+            belief = belief.unsqueeze(1)
+            prior = prior.unsqueeze(1)
+            syl_feat = syl_feat.unsqueeze(1)
+            error = error.unsqueeze(1)
+
+        h_top = self.hypothesis_proj(belief)
+
+        x_bot = self.evidence_encoder(torch.cat([prior, syl_feat], dim=-1))
+        h_bot, hidden = self.evidence_gru(x_bot, hidden)
+
+        gate = self.comparison_gate(error)
+        h_fused = gate * h_bot + (1 - gate) * h_top
+
+        logits = self.policy_head(h_fused)
+        value = self.value_head(h_fused)
+
+        if squeeze:
+            logits = logits.squeeze(1)
+            value = value.squeeze(1)
+
+        return logits, value, hidden
+
+    def get_action(
+        self,
+        belief: torch.Tensor,
+        prior: torch.Tensor,
+        syl_feat: torch.Tensor,
+        error: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+        deterministic: bool = False,
+    ) -> Tuple[int, float, float, torch.Tensor]:
+        """Sample a single action for environment stepping."""
+        logits, value, hidden = self.forward(belief, prior, syl_feat, error, hidden)
+        dist = torch.distributions.Categorical(logits=logits.squeeze(0))
+        if deterministic:
+            action = logits.squeeze(0).argmax().item()
+        else:
+            action = dist.sample().item()
+        log_prob = dist.log_prob(torch.tensor(action, device=logits.device)).item()
+        return action, log_prob, value.squeeze().item(), hidden
+
+
+# ---------------------------------------------------------------------------
 # CTC word decoder utilities
 # ---------------------------------------------------------------------------
 
@@ -395,8 +522,9 @@ class ASRSchedulerEnv:
     def observe(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Current observation: (belief_t, prior_t, syl_feat_t, distortion_t).
 
-        distortion_t is None when the environment was created without distortions
-        (backward-compatible with pre-v2 code paths).
+        distortion_t is the distortion scalar from WordDistortionModule (v2) or
+        the final comparison error from ComparisonRefinementEncoder (v3).
+        It is None when the environment was created without distortions.
         """
         dist_t: torch.Tensor | None = None
         if self.distortions is not None and self.t < self.distortions.shape[0]:
@@ -646,6 +774,7 @@ class Transition:
     value: float
     reward: float
     distortion: Optional[torch.Tensor] = None  # (1,) HuperJEPA v2
+    error: Optional[torch.Tensor] = None        # (1,) HuperJEPA v3 comparison error
 
 
 @dataclass
@@ -807,8 +936,11 @@ def grpo_update(
                 d = (torch.stack(_d_list).unsqueeze(0).to(device)  # (1,T,1)
                      if _d_list[0] is not None else None)
 
-                # Full-sequence forward pass with correct GRU hidden state.
-                logits, _, _ = agent(b, p, s, distortion=d)
+                if isinstance(agent, ActiveAgent):
+                    err = d if d is not None else torch.zeros(1, b.shape[1], 1, device=device)
+                    logits, _, _ = agent(b, p, s, err)
+                else:
+                    logits, _, _ = agent(b, p, s, distortion=d)
                 logits = logits.squeeze(0)  # (T, 2)
 
                 dist = torch.distributions.Categorical(logits=logits)
@@ -848,7 +980,7 @@ def grpo_update(
 
 
 def collect_episode(
-    agent: SchedulerAgent,
+    agent: nn.Module,
     env: "ASRSchedulerEnv",
     device: torch.device,
     temperature: float = 1.0,
@@ -868,6 +1000,7 @@ def collect_episode(
         if env.oracle_emit is not None else None
     )
     hidden = None
+    is_active = isinstance(agent, ActiveAgent)
 
     while not env.done:
         belief, prior, syl_feat, dist_obs = env.observe()
@@ -877,7 +1010,11 @@ def collect_episode(
         d = dist_obs.unsqueeze(0).to(device) if dist_obs is not None else None
 
         with torch.no_grad():
-            logits, value_t, hidden = agent(b, p, s, hidden, distortion=d)
+            if is_active:
+                err = d if d is not None else torch.zeros(1, 1, device=device)
+                logits, value_t, hidden = agent(b, p, s, err, hidden)
+            else:
+                logits, value_t, hidden = agent(b, p, s, hidden, distortion=d)
         logits = logits.squeeze(0)  # (2,)
         dist = torch.distributions.Categorical(logits=logits / temperature)
         action = dist.sample().item()
@@ -890,6 +1027,7 @@ def collect_episode(
             belief=belief, prior=prior, syl_feat=syl_feat,
             action=action, log_prob=log_prob, value=value, reward=reward,
             distortion=dist_obs,
+            error=dist_obs,
         ))
 
     return buf
@@ -897,7 +1035,7 @@ def collect_episode(
 
 @torch.no_grad()
 def _collect_word_match_batched(
-    agent: SchedulerAgent,
+    agent: nn.Module,
     env: "ASRSchedulerEnv",
     device: torch.device,
     n_rollouts: int,
@@ -981,7 +1119,11 @@ def _collect_word_match_batched(
         d_t = (distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
                if distortions_K is not None else None)                 # (N, 1, 1) or None
 
-        logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden, distortion=d_t)
+        if isinstance(agent, ActiveAgent):
+            err_t = d_t if d_t is not None else torch.zeros(N, 1, 1, device=device)
+            logits_t, values_t, hidden = agent(b_t, p_t, s_t, err_t, hidden)
+        else:
+            logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden, distortion=d_t)
         # logits_t: (N, 1, 2);  values_t: (N, 1, 1)
 
         logits_sq   = logits_t.squeeze(1)                              # (N, 2)
@@ -1067,6 +1209,7 @@ def _collect_word_match_batched(
     for n in range(N):
         buf = EpisodeBuffer(oracle_labels=oracle_labels)
         for t in range(K):
+            dist_t = s_distortions[t]
             buf.append(Transition(
                 belief=s_beliefs[t],
                 prior=s_priors[t],
@@ -1075,7 +1218,8 @@ def _collect_word_match_batched(
                 log_prob=s_log_probs[t][n].item(),
                 value=s_values[t][n].item(),
                 reward=s_rewards[n][t],
-                distortion=s_distortions[t],
+                distortion=dist_t,
+                error=dist_t,
             ))
         buffers.append(buf)
 
@@ -1084,7 +1228,7 @@ def _collect_word_match_batched(
 
 @torch.no_grad()
 def collect_episodes_batched(
-    agent: SchedulerAgent,
+    agent: nn.Module,
     env: "ASRSchedulerEnv",
     device: torch.device,
     n_rollouts: int,
@@ -1178,7 +1322,11 @@ def collect_episodes_batched(
         d_t = (distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
                if distortions_K is not None else None)               # (N, 1, 1) or None
 
-        logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden, distortion=d_t)
+        if isinstance(agent, ActiveAgent):
+            err_t = d_t if d_t is not None else torch.zeros(N, 1, 1, device=device)
+            logits_t, values_t, hidden = agent(b_t, p_t, s_t, err_t, hidden)
+        else:
+            logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden, distortion=d_t)
         # logits_t: (N, 1, 2),  values_t: (N, 1, 1)
 
         logits_sq = logits_t.squeeze(1)  # (N, 2)
@@ -1278,6 +1426,7 @@ def collect_episodes_batched(
             oracle_labels=oracle[:K].clone() if oracle is not None else None
         )
         for t in range(K):
+            dist_t = all_distortions[t]
             ep.append(Transition(
                 belief      = all_beliefs[t],
                 prior       = all_priors[t],
@@ -1286,7 +1435,8 @@ def collect_episodes_batched(
                 log_prob    = float(all_log_probs[t][i].item()),
                 value       = float(all_values[t][i].item()),
                 reward      = float(all_rewards[t][i].item()),
-                distortion  = all_distortions[t],
+                distortion  = dist_t,
+                error       = dist_t,
             ))
         episodes.append(ep)
     return episodes

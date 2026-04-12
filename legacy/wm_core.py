@@ -1,7 +1,7 @@
 """Core model, dataset, collator, and evaluation utilities for the Belief World Model.
 
-Architecture (supports two belief backends)
-============================================
+Architecture (supports three belief backends)
+==============================================
 
 **GRU mode** (belief_type="gru", original):
     slots → sequential GRU rollout → beliefs + priors
@@ -12,7 +12,13 @@ Architecture (supports two belief backends)
     masked slots → online encoder + predictor → z_pred (for JEPA loss)
     full slots   → EMA target encoder        → z_target (stop-gradient)
 
-Read-out heads are shared across both modes:
+**Comparison mode** (belief_type="comparison", v3):
+    slots → CausalConformer (3 layers) → priors  (causal streaming)
+    priors → iterative ComparisonRefinementBlocks → beliefs (refined)
+    Each iteration: error = ||belief - prior||, gate, fuse, Conformer refine
+    Final error replaces WordDistortionModule as the convergence signal.
+
+Read-out heads are shared across all modes:
     - frame-level phone CTC  (evidence + belief context → realized phones)
     - slot-level canonical CTC (upsampled beliefs → canonical phones)
     - slot-level evidence CTC (upsampled slots → realized phones)
@@ -33,6 +39,11 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from wm_common import Vocabulary, levenshtein_distance, load_jsonl, read_json
+from wm_comparison import (
+    ComparisonRefinementConfig,
+    ComparisonRefinementEncoder,
+    convergence_loss,
+)
 from wm_distortion import DistortionConfig, WordDistortionModule
 from wm_jepa import (
     JEPAConfig,
@@ -55,8 +66,8 @@ class BeliefWMConfig:
     evidence_dim: int = 46
     hidden_dim: int = 256
     phone_vocab_size: int = 90
-    belief_type: str = "gru"  # gru | jepa
-    pooling_type: str = "mean"  # mean | attention | energy | boundary_attention
+    belief_type: str = "gru"  # gru | jepa | comparison
+    pooling_type: str = "mean"  # mean | attention | energy | boundary_attention | enhanced_boundary
     boundary_attn_heads: int = 4   # num_heads for BoundaryAwareCrossAttnPool
     upsample_factor: int = 4
     dropout: float = 0.1
@@ -97,6 +108,12 @@ class BeliefWMConfig:
     use_distortion: bool = False
     distortion_loss_weight: float = 0.5
     distortion_init_threshold: float = 0.3
+    # --- Comparison Refinement (HuperJEPA v3) ---
+    num_refinements: int = 2
+    refinement_heads: int = 4
+    refinement_ff_dim: int = 512
+    refinement_conv_kernel: int = 15
+    convergence_loss_weight: float = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +319,71 @@ class BoundaryAwareCrossAttnPool(nn.Module):
 
         # 4. Residual + LayerNorm for training stability.
         return self.output_norm(attn_out + queries)
+
+
+# ---------------------------------------------------------------------------
+# EnhancedBoundaryAttnPool  (HuperJEPA v3 — adds inter-slot context)
+# ---------------------------------------------------------------------------
+
+
+class EnhancedBoundaryAttnPool(nn.Module):
+    """Cross-attention pooling with causal inter-slot self-attention (v3).
+
+    Extends BoundaryAwareCrossAttnPool by adding a causal self-attention
+    layer over the slot summaries, allowing each slot to adjust its
+    representation based on preceding slots' content.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        projected: torch.Tensor,   # (B, T, H)
+        boundaries: torch.Tensor,  # (B, K, 2)
+        slot_mask: torch.Tensor,   # (B, K)
+    ) -> torch.Tensor:
+        B, T, H = projected.shape
+        K = slot_mask.shape[1]
+
+        init_slots = pool_evidence_mean(projected, boundaries, slot_mask)
+        queries = self.query_proj(init_slots)
+
+        boundary_mask = _build_boundary_attn_mask(
+            boundaries, slot_mask, T, self.num_heads
+        )
+        attn_out, _ = self.cross_attn(
+            query=queries, key=projected, value=projected,
+            attn_mask=boundary_mask, need_weights=False,
+        )
+        slots = self.cross_norm(attn_out + queries)
+
+        pad_mask = slot_mask < 0.5
+        causal_mask = torch.triu(
+            torch.full((K, K), float("-inf"), device=slots.device), diagonal=1
+        )
+        ctx, _ = self.self_attn(
+            slots, slots, slots,
+            key_padding_mask=pad_mask, attn_mask=causal_mask,
+            need_weights=False,
+        )
+        return self.output_norm(ctx + slots)
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +649,23 @@ class EnrichedSlotizer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _build_comparison_config(cfg: BeliefWMConfig) -> ComparisonRefinementConfig:
+    return ComparisonRefinementConfig(
+        hidden_dim=cfg.hidden_dim,
+        prior_layers=cfg.jepa_prior_layers,
+        prior_heads=cfg.jepa_prior_heads,
+        prior_ff_dim=cfg.jepa_encoder_ff_dim,
+        prior_conv_kernel=cfg.jepa_encoder_conv_kernel,
+        num_refinements=cfg.num_refinements,
+        refinement_heads=cfg.refinement_heads,
+        refinement_ff_dim=cfg.refinement_ff_dim,
+        refinement_conv_kernel=cfg.refinement_conv_kernel,
+        dropout=cfg.dropout,
+        max_slots=200,
+        convergence_loss_weight=cfg.convergence_loss_weight,
+    )
+
+
 def _build_jepa_config(cfg: BeliefWMConfig) -> JEPAConfig:
     return JEPAConfig(
         hidden_dim=cfg.hidden_dim,
@@ -643,6 +742,8 @@ class BeliefWorldModel(nn.Module):
             self.pooling = EnergyWeightedPool(H)
         elif config.pooling_type == "boundary_attention":
             self.pooling = BoundaryAwareCrossAttnPool(H, config.boundary_attn_heads)
+        elif config.pooling_type == "enhanced_boundary":
+            self.pooling = EnhancedBoundaryAttnPool(H, config.boundary_attn_heads)
 
         # ---- Word Distortion Module (HuperJEPA v2) ----
         self.distortion_module: WordDistortionModule | None = None
@@ -655,11 +756,16 @@ class BeliefWorldModel(nn.Module):
             self.distortion_module = WordDistortionModule(dcfg)
 
         # ==================================================================
-        # Belief backend: GRU or JEPA
+        # Belief backend: GRU, JEPA, or Comparison
         # ==================================================================
         self._use_jepa = config.belief_type == "jepa"
+        self._use_comparison = config.belief_type == "comparison"
 
-        if self._use_jepa:
+        if self._use_comparison:
+            cmp_cfg = _build_comparison_config(config)
+            self._comparison_cfg = cmp_cfg
+            self.comparison_encoder = ComparisonRefinementEncoder(cmp_cfg)
+        elif self._use_jepa:
             import copy as _copy
 
             jcfg = _build_jepa_config(config)
@@ -752,11 +858,12 @@ class BeliefWorldModel(nn.Module):
             "canonical_logits": out["canonical_logits"],
             "up_slot_mask": out["up_slot_mask"],
         }
-        # Include distortion outputs if the module is active (HuperJEPA v2).
         if "distortions" in out:
             result["distortions"] = out["distortions"]  # (B, K, 1)
         if "word_states" in out:
             result["word_states"] = out["word_states"]  # (B, K, H)
+        if "comparison_errors" in out:
+            result["comparison_errors"] = out["comparison_errors"]
         return result
 
     # ---- helpers -----------------------------------------------------------
@@ -926,7 +1033,13 @@ class BeliefWorldModel(nn.Module):
             slots = self._pool(projected, boundaries, slot_mask)
 
         # --- belief computation ---
-        if self._use_jepa:
+        comparison_errors: list[torch.Tensor] | None = None
+        jepa_out: dict | None = None
+        if self._use_comparison:
+            beliefs, priors, comparison_errors = self.comparison_encoder(
+                slots, slot_mask
+            )
+        elif self._use_jepa:
             need_jepa = compute_jepa_loss if compute_jepa_loss is not None else self.training
             jepa_out = self._belief_encode_jepa(
                 slots, slot_mask, compute_jepa_loss=need_jepa
@@ -939,7 +1052,7 @@ class BeliefWorldModel(nn.Module):
             )
 
         # --- fast path: skip read-out heads when only JEPA loss is needed ---
-        if jepa_only and self._use_jepa:
+        if jepa_only and self._use_jepa and jepa_out is not None:
             out: Dict[str, torch.Tensor] = {
                 "slots": slots,
                 "beliefs": beliefs,
@@ -954,10 +1067,12 @@ class BeliefWorldModel(nn.Module):
                 out["jepa_mask"] = jepa_out["jepa_mask"]
             return out
 
-        # --- word distortion (HuperJEPA v2) ---
+        # --- word distortion / comparison error ---
         distortions: torch.Tensor | None = None
         word_states: torch.Tensor | None = None
-        if self.distortion_module is not None:
+        if self._use_comparison and comparison_errors is not None:
+            distortions = comparison_errors[-1]  # final error → distortion
+        elif self.distortion_module is not None:
             distortions, word_states = self.distortion_module.forward_sequence(
                 beliefs, priors, slot_mask
             )
@@ -1004,7 +1119,9 @@ class BeliefWorldModel(nn.Module):
         if word_states is not None:
             out["word_states"] = word_states  # (B, K, H)
 
-        if self._use_jepa:
+        if self._use_comparison and comparison_errors is not None:
+            out["comparison_errors"] = comparison_errors
+        elif self._use_jepa and jepa_out is not None:
             if jepa_out["z_pred"] is not None:
                 out["z_pred"] = jepa_out["z_pred"]
             if jepa_out["z_target"] is not None:

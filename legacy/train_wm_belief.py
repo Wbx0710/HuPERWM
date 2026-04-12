@@ -36,6 +36,7 @@ from wm_core import (
     compute_ctc_loss,
     evaluate_belief_wm,
 )
+from wm_comparison import convergence_loss
 from wm_jepa import check_collapse, compute_jepa_loss, compute_sigreg_loss, compute_vicreg_loss
 from wm_online_data import OnlineLibriSpeechWMDataset
 from wm_teacher import load_teacher_phone_cache
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument(
         "--pooling-type",
-        choices=["mean", "attention", "energy", "boundary_attention"],
+        choices=["mean", "attention", "energy", "boundary_attention", "enhanced_boundary"],
         default="mean",
     )
     p.add_argument("--boundary-attn-heads", type=int, default=4,
@@ -126,7 +127,7 @@ def parse_args() -> argparse.Namespace:
                    help="Dropout in frame_phone_head to reduce overfitting.")
 
     # --- JEPA / Plan C ---
-    p.add_argument("--belief-type", choices=["gru", "jepa"], default="gru")
+    p.add_argument("--belief-type", choices=["gru", "jepa", "comparison"], default="gru")
     p.add_argument("--jepa-encoder-layers", type=int, default=6)
     p.add_argument("--jepa-encoder-heads", type=int, default=8)
     p.add_argument("--jepa-encoder-ff-dim", type=int, default=1024)
@@ -167,6 +168,18 @@ def parse_args() -> argparse.Namespace:
                    help="Input dropout rate for the canonical CTC head (default 0.0).")
     p.add_argument("--stage1-checkpoint", type=str, default=None,
                    help="Path to Stage 1 JEPA checkpoint to initialise from.")
+
+    # --- Comparison Refinement (v3) ---
+    p.add_argument("--num-refinements", type=int, default=2,
+                   help="Number of comparison-refinement iterations (v3).")
+    p.add_argument("--refinement-heads", type=int, default=4,
+                   help="Attention heads per refinement Conformer block (v3).")
+    p.add_argument("--refinement-ff-dim", type=int, default=512,
+                   help="Feed-forward dim in refinement Conformer block (v3).")
+    p.add_argument("--refinement-conv-kernel", type=int, default=15,
+                   help="Convolution kernel size in refinement Conformer block (v3).")
+    p.add_argument("--convergence-loss-weight", type=float, default=0.2,
+                   help="Weight for convergence loss (encourages error to decrease across iterations).")
 
     # --- TTS ---
     p.add_argument("--use-tts", action="store_true", help="Enable TTS flow-matching decoder.")
@@ -300,6 +313,7 @@ class BeliefWMLitModule(pl.LightningModule):
         self.args = args
         self.tts_decoder = tts_decoder
         self._use_jepa = config.belief_type == "jepa"
+        self._use_comparison = config.belief_type == "comparison"
         if self._use_jepa:
             self.automatic_optimization = False
 
@@ -463,8 +477,9 @@ class BeliefWMLitModule(pl.LightningModule):
                 loss_dict["loss"] = loss_dict["loss"] + vicreg_weight * vicreg_loss
 
         # SIGReg (Maes et al., LeWM 2026): alternative to VICReg via Epps-Pulley test.
+        # Active for both JEPA and Comparison modes.
         sigreg_weight = getattr(self.args, "sigreg_weight", 0.0)
-        if self._use_jepa and sigreg_weight > 0:
+        if (self._use_jepa or self._use_comparison) and sigreg_weight > 0:
             sigreg_n = getattr(self.args, "sigreg_projections", 64)
             sigreg_target = (
                 outputs["z_pred"] if "z_pred" in outputs else outputs.get("beliefs")
@@ -475,6 +490,13 @@ class BeliefWMLitModule(pl.LightningModule):
                 )
                 loss_dict["sigreg_loss"] = sigreg_loss
                 loss_dict["loss"] = loss_dict["loss"] + sigreg_weight * sigreg_loss
+
+        # --- Convergence loss (HuperJEPA v3) ---
+        conv_weight = getattr(self.args, "convergence_loss_weight", 0.0)
+        if self._use_comparison and conv_weight > 0 and "comparison_errors" in outputs:
+            conv_loss = convergence_loss(outputs["comparison_errors"], sm)
+            loss_dict["convergence_loss"] = conv_loss
+            loss_dict["loss"] = loss_dict["loss"] + conv_weight * conv_loss
 
         # --- Word Distortion loss (HuperJEPA v2) ---
         dist_weight = getattr(self.args, "distortion_loss_weight", 0.0)
@@ -803,6 +825,11 @@ def main() -> None:
         use_distortion=args.use_distortion,
         distortion_loss_weight=args.distortion_loss_weight,
         distortion_init_threshold=args.distortion_init_threshold,
+        num_refinements=args.num_refinements,
+        refinement_heads=args.refinement_heads,
+        refinement_ff_dim=args.refinement_ff_dim,
+        refinement_conv_kernel=args.refinement_conv_kernel,
+        convergence_loss_weight=args.convergence_loss_weight,
     )
 
     tts_decoder = None

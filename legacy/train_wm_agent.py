@@ -42,6 +42,8 @@ from wm_agent import (
     WAIT,
     collect_episode,
     collect_episodes_batched,
+    ActiveAgent,
+    ActiveAgentConfig,
     AgentConfig,
     ASRSchedulerEnv,
     EnvConfig,
@@ -241,7 +243,12 @@ def train_il_epoch(
         syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)  # (B, K, 3)
 
         distortions = batch["distortions"].to(device) if "distortions" in batch else None
-        logits, _values, _ = agent(beliefs, priors, syl_feats, distortion=distortions)  # (B, K, 2)
+        raw = agent.module if isinstance(agent, DDP) else agent
+        if isinstance(raw, ActiveAgent):
+            error = distortions if distortions is not None else torch.zeros(beliefs.shape[0], beliefs.shape[1], 1, device=device)
+            logits, _values, _ = agent(beliefs, priors, syl_feats, error)
+        else:
+            logits, _values, _ = agent(beliefs, priors, syl_feats, distortion=distortions)  # (B, K, 2)
 
         # Cross-entropy on full [WAIT, EMIT] distribution with class weighting.
         actions = oracle.long()  # (B, K): 0=WAIT, 1=EMIT
@@ -323,7 +330,12 @@ def eval_il(
         syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)
 
         distortions = batch["distortions"].to(device) if "distortions" in batch else None
-        logits, _, _ = agent(beliefs, priors, syl_feats, distortion=distortions)  # (B, K, 2)
+        raw = agent.module if isinstance(agent, DDP) else agent
+        if isinstance(raw, ActiveAgent):
+            error = distortions if distortions is not None else torch.zeros(beliefs.shape[0], beliefs.shape[1], 1, device=device)
+            logits, _, _ = agent(beliefs, priors, syl_feats, error)
+        else:
+            logits, _, _ = agent(beliefs, priors, syl_feats, distortion=distortions)  # (B, K, 2)
         preds = logits.argmax(dim=-1).float()  # (B, K): argmax over [WAIT, EMIT]
         mask = slot_mask.bool()
         total_correct += ((preds == oracle) & mask).sum()
@@ -431,8 +443,12 @@ def ppo_update(
             d_ppo = (torch.stack(_d_list).unsqueeze(0).to(device)
                      if _d_list[0] is not None else None)
 
-            # (1,T,2) and (1,T,1) with proper sequential GRU context
-            logits, values_pred, _ = agent(b, p, s, distortion=d_ppo)
+            raw_for_check = agent.module if isinstance(agent, DDP) else agent
+            if isinstance(raw_for_check, ActiveAgent):
+                err_ppo = d_ppo if d_ppo is not None else torch.zeros(1, b.shape[1], 1, device=device)
+                logits, values_pred, _ = agent(b, p, s, err_ppo)
+            else:
+                logits, values_pred, _ = agent(b, p, s, distortion=d_ppo)
             logits      = logits.squeeze(0)           # (T, 2)
             values_pred = values_pred.squeeze(0).squeeze(-1)  # (T,)
 
@@ -599,6 +615,10 @@ def parse_args() -> argparse.Namespace:
                    help="Append 1 distortion scalar to the observation (HuperJEPA v2). "
                         "Requires agent data extracted from a --use-distortion Stage 2 "
                         "checkpoint (distortions field must be present).")
+    p.add_argument("--use-active-agent", action="store_true",
+                   help="Use ActiveAgent (v3) with dual-pathway comparison gating instead "
+                        "of SchedulerAgent. Requires agent data extracted from a "
+                        "belief_type=comparison Stage 2 checkpoint.")
 
     # IL hyperparameters
     p.add_argument("--il-epochs", type=int, default=30)
@@ -779,15 +799,25 @@ def main() -> None:
         pin_memory=True,
     )
 
-    cfg = AgentConfig(
-        belief_dim=args.belief_dim,
-        agent_hidden=args.agent_hidden,
-        gru_layers=args.gru_layers,
-        dropout=args.agent_dropout,
-        use_extra_features=getattr(args, "use_extra_features", False),
-        use_distortion=getattr(args, "use_distortion", False),
-    )
-    agent_raw = SchedulerAgent(cfg).to(device)
+    use_active = getattr(args, "use_active_agent", False)
+    if use_active:
+        cfg = ActiveAgentConfig(
+            belief_dim=args.belief_dim,
+            agent_hidden=args.agent_hidden,
+            gru_layers=args.gru_layers,
+            dropout=args.agent_dropout,
+        )
+        agent_raw = ActiveAgent(cfg).to(device)
+    else:
+        cfg = AgentConfig(
+            belief_dim=args.belief_dim,
+            agent_hidden=args.agent_hidden,
+            gru_layers=args.gru_layers,
+            dropout=args.agent_dropout,
+            use_extra_features=getattr(args, "use_extra_features", False),
+            use_distortion=getattr(args, "use_distortion", False),
+        )
+        agent_raw = SchedulerAgent(cfg).to(device)
 
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
