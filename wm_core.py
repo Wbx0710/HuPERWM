@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from wm_common import Vocabulary, levenshtein_distance, load_jsonl, read_json
+from wm_distortion import DistortionConfig, WordDistortionModule
 from wm_jepa import (
     JEPAConfig,
     ConformerDAAMEncoder,
@@ -55,7 +56,8 @@ class BeliefWMConfig:
     hidden_dim: int = 256
     phone_vocab_size: int = 90
     belief_type: str = "gru"  # gru | jepa
-    pooling_type: str = "mean"  # mean | attention
+    pooling_type: str = "mean"  # mean | attention | energy | boundary_attention
+    boundary_attn_heads: int = 4   # num_heads for BoundaryAwareCrossAttnPool
     upsample_factor: int = 4
     dropout: float = 0.1
     # --- Identity-aware modulation (proposal §5.5) ---
@@ -91,6 +93,10 @@ class BeliefWMConfig:
     jepa_mask_ratio: float = 0.5
     jepa_mask_min_span: int = 1
     jepa_mask_max_span: int | None = None
+    # --- Word Distortion Module (HuperJEPA v2) ---
+    use_distortion: bool = False
+    distortion_loss_weight: float = 0.5
+    distortion_init_threshold: float = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +147,161 @@ class AttentionPooling(nn.Module):
         masked = masked.masked_fill(~in_slot, float("-inf"))
         w = F.softmax(masked, dim=1).masked_fill(~in_slot, 0.0)
         return torch.einsum("btk,bth->bkh", w, projected)
+
+
+# ---------------------------------------------------------------------------
+# EnergyWeightedPool  (HuperJEPA v2 — handles Sylber silence contamination)
+# ---------------------------------------------------------------------------
+
+
+class EnergyWeightedPool(nn.Module):
+    """Learnable energy-gated pooling.
+
+    Addresses the Sylber full-coverage problem: when Sylber segments tile
+    the entire audio without gaps, silence frames (word-internal pauses,
+    breath, background) end up inside syllable slots and dilute slot
+    representations through plain mean pooling.
+
+    Here a lightweight MLP estimates each frame's acoustic activity (energy
+    / speech-likelihood).  Silence frames receive near-zero weight so they
+    barely influence the slot summary.
+
+    Forward signature is identical to pool_evidence_mean / AttentionPooling
+    for drop-in replacement.
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.energy_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Sigmoid(),   # per-frame activity weight in [0, 1]
+        )
+
+    def forward(
+        self,
+        projected: torch.Tensor,   # (B, T, H)
+        boundaries: torch.Tensor,  # (B, K, 2)
+        slot_mask: torch.Tensor,   # (B, K)
+    ) -> torch.Tensor:
+        B, T, H = projected.shape
+        K = slot_mask.shape[1]
+        # Per-frame activity weight: high for speech, low for silence.
+        activity = self.energy_gate(projected).squeeze(-1)  # (B, T)
+
+        tidx = torch.arange(T, device=projected.device).view(1, T, 1)
+        starts = boundaries[:, :, 0].unsqueeze(1)  # (B, 1, K)
+        ends   = boundaries[:, :, 1].unsqueeze(1)  # (B, 1, K)
+        in_slot = (tidx >= starts) & (tidx < ends) & (slot_mask.unsqueeze(1) > 0)  # (B,T,K)
+
+        # Energy-weighted pooling: weight = activity * in_slot indicator.
+        w = in_slot.float() * activity.unsqueeze(-1)         # (B, T, K)
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-6)   # normalise per slot
+        return torch.einsum("btk,bth->bkh", w, projected)
+
+
+# ---------------------------------------------------------------------------
+# BoundaryAwareCrossAttnPool  (HuperJEPA v2 — Sylber as attention trigger)
+# ---------------------------------------------------------------------------
+
+
+def _build_boundary_attn_mask(
+    boundaries: torch.Tensor,  # (B, K, 2)
+    slot_mask: torch.Tensor,   # (B, K)
+    T: int,
+    num_heads: int,
+) -> torch.Tensor:
+    """Build (B*num_heads, K, T) boolean attention mask.
+
+    True  = position is blocked (outside the syllable boundary or padding).
+    False = position is allowed (inside the syllable boundary).
+
+    PyTorch MHA with attn_mask: True entries are masked to -inf.
+    """
+    B, K = slot_mask.shape
+    tidx = torch.arange(T, device=boundaries.device).view(1, 1, T)   # (1,1,T)
+    starts = boundaries[:, :, 0].unsqueeze(-1)  # (B, K, 1)
+    ends   = boundaries[:, :, 1].unsqueeze(-1)  # (B, K, 1)
+    in_boundary = (tidx >= starts) & (tidx < ends)                    # (B, K, T)
+    valid_slot  = (slot_mask > 0.5).unsqueeze(-1)                      # (B, K, 1)
+    allowed = in_boundary & valid_slot                                  # (B, K, T)
+    # MHA expects True = block → invert.
+    blocked = ~allowed                                                  # (B, K, T)
+    # Repeat for each attention head: (B*H, K, T).
+    return blocked.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(B * num_heads, K, T)
+
+
+class BoundaryAwareCrossAttnPool(nn.Module):
+    """Sylber-gated cross-attention pooling (HuperJEPA v2).
+
+    Motivation
+    ----------
+    Plain mean-pooling reduces each syllable to a single centroid, erasing
+    the sub-syllabic acoustic trajectory (formant transitions, energy onset,
+    closure bursts).  Instead we let the Sylber boundary position act as a
+    *query*: the boundary token cross-attends over the 50 Hz HuPER frames
+    *within that syllable*, actively selecting the most informative frames.
+
+    Design
+    ------
+    1. Coarse initialisation: mean-pool frames in each slot → init_slots (B,K,H).
+       This provides a reasonable starting query for the cross-attention.
+    2. query_proj: linear map init_slots → queries (B, K, H).
+    3. Cross-attention: each slot query attends only to the frames inside its
+       Sylber boundary (hard mask — frames outside → -inf).
+    4. Residual + LayerNorm: output = LN(cross_attn_out + queries).
+
+    The 50 Hz frame features are preserved in full; no information is
+    destroyed before the attention computes the slot summary.
+
+    Forward signature is identical to AttentionPooling for drop-in use.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        # Project coarse-init slot to attention query.
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Cross-attention: queries=(B,K,H), keys/values=(B,T,H).
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        projected: torch.Tensor,   # (B, T, H) — full-resolution 50 Hz frames
+        boundaries: torch.Tensor,  # (B, K, 2)
+        slot_mask: torch.Tensor,   # (B, K)
+    ) -> torch.Tensor:
+        B, T, H = projected.shape
+        K = slot_mask.shape[1]
+
+        # 1. Coarse init via mean pooling (cheap, good starting query).
+        init_slots = pool_evidence_mean(projected, boundaries, slot_mask)  # (B, K, H)
+        queries = self.query_proj(init_slots)                               # (B, K, H)
+
+        # 2. Per-sample boundary attention mask: (B*num_heads, K, T).
+        #    True = masked (outside boundary or padding slot).
+        boundary_mask = _build_boundary_attn_mask(
+            boundaries, slot_mask, T, self.num_heads
+        )  # (B*H, K, T) bool
+
+        # 3. Cross-attention — each slot attends only to its own frames.
+        attn_out, _ = self.cross_attn(
+            query=queries,      # (B, K, H)
+            key=projected,      # (B, T, H)
+            value=projected,    # (B, T, H)
+            attn_mask=boundary_mask,   # True = block (B*H, K, T)
+            need_weights=False,
+        )  # → (B, K, H)
+
+        # 4. Residual + LayerNorm for training stability.
+        return self.output_norm(attn_out + queries)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +639,20 @@ class BeliefWorldModel(nn.Module):
             )
         elif config.pooling_type == "attention":
             self.pooling = AttentionPooling(H)
+        elif config.pooling_type == "energy":
+            self.pooling = EnergyWeightedPool(H)
+        elif config.pooling_type == "boundary_attention":
+            self.pooling = BoundaryAwareCrossAttnPool(H, config.boundary_attn_heads)
+
+        # ---- Word Distortion Module (HuperJEPA v2) ----
+        self.distortion_module: WordDistortionModule | None = None
+        if config.use_distortion:
+            dcfg = DistortionConfig(
+                hidden_dim=H,
+                distortion_loss_weight=config.distortion_loss_weight,
+                init_threshold=config.distortion_init_threshold,
+            )
+            self.distortion_module = WordDistortionModule(dcfg)
 
         # ==================================================================
         # Belief backend: GRU or JEPA
@@ -569,7 +744,7 @@ class BeliefWorldModel(nn.Module):
             evidence, boundaries, slot_mask, num_frames,
             frame_mask=frame_mask, compute_jepa_loss=False,
         )
-        return {
+        result = {
             "slots": out["slots"],
             "beliefs": out["beliefs"],
             "priors": out["priors"],
@@ -577,6 +752,12 @@ class BeliefWorldModel(nn.Module):
             "canonical_logits": out["canonical_logits"],
             "up_slot_mask": out["up_slot_mask"],
         }
+        # Include distortion outputs if the module is active (HuperJEPA v2).
+        if "distortions" in out:
+            result["distortions"] = out["distortions"]  # (B, K, 1)
+        if "word_states" in out:
+            result["word_states"] = out["word_states"]  # (B, K, H)
+        return result
 
     # ---- helpers -----------------------------------------------------------
 
@@ -773,6 +954,14 @@ class BeliefWorldModel(nn.Module):
                 out["jepa_mask"] = jepa_out["jepa_mask"]
             return out
 
+        # --- word distortion (HuperJEPA v2) ---
+        distortions: torch.Tensor | None = None
+        word_states: torch.Tensor | None = None
+        if self.distortion_module is not None:
+            distortions, word_states = self.distortion_module.forward_sequence(
+                beliefs, priors, slot_mask
+            )
+
         # --- read-out heads ---
         belief_frames = broadcast_to_frames(beliefs, boundaries, slot_mask, T)
         detach_bf = getattr(self.config, "detach_belief_for_frame_phone", False)
@@ -808,6 +997,12 @@ class BeliefWorldModel(nn.Module):
             "future_pred": self.future_head(future_input),
             "evidence_recon": self.recon_head(beliefs),
         }
+
+        # word distortion outputs (HuperJEPA v2)
+        if distortions is not None:
+            out["distortions"] = distortions  # (B, K, 1)
+        if word_states is not None:
+            out["word_states"] = word_states  # (B, K, H)
 
         if self._use_jepa:
             if jepa_out["z_pred"] is not None:

@@ -51,6 +51,9 @@ class AgentConfig:
     #   True  → 2 extra dims: cosine_sim(belief, prior), entropy(softmax(belief))
     #   False → original 3-dim syl_feat only (backward-compat)
     use_extra_features: bool = False
+    # Word distortion signal (HuperJEPA v2):
+    #   True  → 1 extra dim: distortion scalar from WordDistortionModule
+    use_distortion: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +78,8 @@ class SchedulerAgent(nn.Module):
         super().__init__()
         self.cfg = cfg
         extra = 2 if cfg.use_extra_features else 0
-        state_dim = cfg.belief_dim * 2 + cfg.syl_feat_dim + extra
+        distortion_dim = 1 if cfg.use_distortion else 0
+        state_dim = cfg.belief_dim * 2 + cfg.syl_feat_dim + extra + distortion_dim
 
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, cfg.agent_hidden),
@@ -131,14 +135,16 @@ class SchedulerAgent(nn.Module):
         prior: torch.Tensor,
         syl_feat: torch.Tensor,
         hidden: torch.Tensor | None = None,
+        distortion: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass for a single time-step (or a sequence).
 
         Args:
-            belief:   (B, [T,] H)
-            prior:    (B, [T,] H)
-            syl_feat: (B, [T,] syl_feat_dim)
-            hidden:   (gru_layers, B, agent_hidden) or None
+            belief:     (B, [T,] H)
+            prior:      (B, [T,] H)
+            syl_feat:   (B, [T,] syl_feat_dim)
+            hidden:     (gru_layers, B, agent_hidden) or None
+            distortion: (B, [T,] 1) optional word distortion scalar (HuperJEPA v2)
 
         Returns:
             logits: (B, [T,] 2)  — action logits [wait, emit]
@@ -150,12 +156,18 @@ class SchedulerAgent(nn.Module):
             belief = belief.unsqueeze(1)
             prior = prior.unsqueeze(1)
             syl_feat = syl_feat.unsqueeze(1)
+            if distortion is not None:
+                distortion = distortion.unsqueeze(1)
 
         if self.cfg.use_extra_features:
             extra = self._compute_extra_features(belief, prior)
             x = torch.cat([belief, prior, syl_feat, extra], dim=-1)
         else:
             x = torch.cat([belief, prior, syl_feat], dim=-1)
+
+        # Append distortion scalar if enabled (HuperJEPA v2).
+        if self.cfg.use_distortion and distortion is not None:
+            x = torch.cat([x, distortion], dim=-1)
 
         x = self.state_encoder(x)
         x, hidden = self.history_gru(x, hidden)
@@ -176,12 +188,13 @@ class SchedulerAgent(nn.Module):
         syl_feat: torch.Tensor,
         hidden: torch.Tensor | None = None,
         deterministic: bool = False,
+        distortion: torch.Tensor | None = None,
     ) -> Tuple[int, float, float, torch.Tensor]:
         """Sample a single action for environment stepping.
 
         Returns: (action, log_prob, value, new_hidden)
         """
-        logits, value, hidden = self.forward(belief, prior, syl_feat, hidden)
+        logits, value, hidden = self.forward(belief, prior, syl_feat, hidden, distortion)
         dist = torch.distributions.Categorical(logits=logits.squeeze(0))
         if deterministic:
             action = logits.squeeze(0).argmax().item()
@@ -300,6 +313,8 @@ class ASRSchedulerEnv:
         env_cfg: EnvConfig | None = None,
         oracle_emit: torch.Tensor | None = None,
         word_phones_list: Optional[List[List[int]]] = None,
+        distortions: torch.Tensor | None = None,   # (K, 1)  HuperJEPA v2
+        word_states: torch.Tensor | None = None,   # (K, H)  HuperJEPA v2
     ) -> None:
         self.beliefs = beliefs          # (K, H)
         self.priors = priors            # (K, H)
@@ -313,8 +328,10 @@ class ASRSchedulerEnv:
         # oracle_emit: (K,) float tensor, 1.0 at word-boundary slots
         self.oracle_emit = oracle_emit
         # word_phones_list[i] = CMU phone IDs for gt_words[i]; [] for OOV words.
-        # Used in "word_match" reward mode.
         self.word_phones_list: List[List[int]] = word_phones_list or []
+        # Word distortion tensors from WordDistortionModule (HuperJEPA v2).
+        self.distortions = distortions  # (K, 1) or None
+        self.word_states = word_states  # (K, H) or None
 
         self.num_slots = int(slot_mask.sum().item())
         self.upsample_factor = self.cfg.upsample_factor
@@ -375,12 +392,20 @@ class ASRSchedulerEnv:
         )
         return torch.stack([log_dur, rel_pos, steps_since])
 
-    def observe(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Current observation: (belief_t, prior_t, syl_feat_t)."""
+    def observe(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Current observation: (belief_t, prior_t, syl_feat_t, distortion_t).
+
+        distortion_t is None when the environment was created without distortions
+        (backward-compatible with pre-v2 code paths).
+        """
+        dist_t: torch.Tensor | None = None
+        if self.distortions is not None and self.t < self.distortions.shape[0]:
+            dist_t = self.distortions[self.t]  # (1,)
         return (
             self.beliefs[self.t],
             self.priors[self.t],
             self._compute_syl_feat(),
+            dist_t,
         )
 
     # ------------------------------------------------------------------
@@ -620,6 +645,7 @@ class Transition:
     log_prob: float
     value: float
     reward: float
+    distortion: Optional[torch.Tensor] = None  # (1,) HuperJEPA v2
 
 
 @dataclass
@@ -777,9 +803,12 @@ def grpo_update(
                     [t.log_prob for t in ep.transitions],
                     dtype=torch.float32, device=device,
                 )  # (T,)
+                _d_list = [t.distortion for t in ep.transitions]
+                d = (torch.stack(_d_list).unsqueeze(0).to(device)  # (1,T,1)
+                     if _d_list[0] is not None else None)
 
                 # Full-sequence forward pass with correct GRU hidden state.
-                logits, _, _ = agent(b, p, s)
+                logits, _, _ = agent(b, p, s, distortion=d)
                 logits = logits.squeeze(0)  # (T, 2)
 
                 dist = torch.distributions.Categorical(logits=logits)
@@ -841,13 +870,14 @@ def collect_episode(
     hidden = None
 
     while not env.done:
-        belief, prior, syl_feat = env.observe()
+        belief, prior, syl_feat, dist_obs = env.observe()
         b = belief.unsqueeze(0).to(device)
         p = prior.unsqueeze(0).to(device)
         s = syl_feat.unsqueeze(0).to(device)
+        d = dist_obs.unsqueeze(0).to(device) if dist_obs is not None else None
 
         with torch.no_grad():
-            logits, value_t, hidden = agent(b, p, s, hidden)
+            logits, value_t, hidden = agent(b, p, s, hidden, distortion=d)
         logits = logits.squeeze(0)  # (2,)
         dist = torch.distributions.Categorical(logits=logits / temperature)
         action = dist.sample().item()
@@ -859,6 +889,7 @@ def collect_episode(
         buf.append(Transition(
             belief=belief, prior=prior, syl_feat=syl_feat,
             action=action, log_prob=log_prob, value=value, reward=reward,
+            distortion=dist_obs,
         ))
 
     return buf
@@ -893,6 +924,8 @@ def _collect_word_match_batched(
     beliefs_K = env.beliefs[:K].to(device)   # (K, H)
     priors_K  = env.priors[:K].to(device)    # (K, H)
     bnd = env.boundaries[:K].to(device)      # (K, 2)
+    distortions_K = (env.distortions[:K].to(device)
+                     if env.distortions is not None else None)  # (K, 1) or None
 
     durations = (bnd[:, 1] - bnd[:, 0]).float().clamp(min=1.0).log()  # (K,)
     rel_pos   = torch.arange(K, device=device).float() / max(K - 1, 1)  # (K,)
@@ -922,13 +955,14 @@ def _collect_word_match_batched(
     gt_idx       = [0] * N                          # GT word pointer per rollout
 
     # Storage (indexed by time step, then assembled into EpisodeBuffers)
-    s_beliefs:    List[torch.Tensor] = []  # (K,) each: belief at step t (shared)
-    s_priors:     List[torch.Tensor] = []
-    s_syl_feats:  List[torch.Tensor] = []  # (K, N, 3)
-    s_actions:    List[torch.Tensor] = []  # (K, N)
-    s_log_probs:  List[torch.Tensor] = []  # (K, N)
-    s_values:     List[torch.Tensor] = []  # (K, N)
-    s_rewards:    List[List[float]]  = [[] for _ in range(N)]  # (N, K)
+    s_beliefs:      List[torch.Tensor] = []  # (K,) each: belief at step t (shared)
+    s_priors:       List[torch.Tensor] = []
+    s_syl_feats:    List[torch.Tensor] = []  # (K, N, 3)
+    s_distortions:  List[Optional[torch.Tensor]] = []  # (K,) each: (1,) or None
+    s_actions:      List[torch.Tensor] = []  # (K, N)
+    s_log_probs:    List[torch.Tensor] = []  # (K, N)
+    s_values:       List[torch.Tensor] = []  # (K, N)
+    s_rewards:      List[List[float]]  = [[] for _ in range(N)]  # (N, K)
 
     hidden: Optional[torch.Tensor] = None
 
@@ -944,8 +978,10 @@ def _collect_word_match_batched(
         b_t = beliefs_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)   # (N, 1, H)
         p_t = priors_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)    # (N, 1, H)
         s_t = syl_feat_t.unsqueeze(1)                                  # (N, 1, 3)
+        d_t = (distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
+               if distortions_K is not None else None)                 # (N, 1, 1) or None
 
-        logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden)
+        logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden, distortion=d_t)
         # logits_t: (N, 1, 2);  values_t: (N, 1, 1)
 
         logits_sq   = logits_t.squeeze(1)                              # (N, 2)
@@ -1019,6 +1055,7 @@ def _collect_word_match_batched(
         s_beliefs.append(beliefs_K[t].cpu())
         s_priors.append(priors_K[t].cpu())
         s_syl_feats.append(syl_feat_t.cpu())          # (N, 3)
+        s_distortions.append(distortions_K[t].cpu() if distortions_K is not None else None)
         s_actions.append(actions_t.cpu())              # (N,)
         s_log_probs.append(log_probs_t.cpu())          # (N,)
         s_values.append(values_t.squeeze(-1).squeeze(-1).cpu())  # (N,)
@@ -1038,6 +1075,7 @@ def _collect_word_match_batched(
                 log_prob=s_log_probs[t][n].item(),
                 value=s_values[t][n].item(),
                 reward=s_rewards[n][t],
+                distortion=s_distortions[t],
             ))
         buffers.append(buf)
 
@@ -1093,6 +1131,8 @@ def collect_episodes_batched(
     beliefs_K = env.beliefs[:K].to(device)   # (K, H)
     priors_K  = env.priors[:K].to(device)    # (K, H)
     bnd = env.boundaries[:K].to(device)      # (K, 2)
+    distortions_K = (env.distortions[:K].to(device)
+                     if env.distortions is not None else None)  # (K, 1) or None
 
     durations = (bnd[:, 1] - bnd[:, 0]).float().clamp(min=1.0).log()  # (K,)
     rel_pos   = torch.arange(K, device=device).float() / max(K - 1, 1) # (K,)
@@ -1112,13 +1152,14 @@ def collect_episodes_batched(
     agent_emit_sets: List[set] = [set() for _ in range(N)]
 
     # Storage: one entry per time step
-    all_beliefs:   List[torch.Tensor] = []
-    all_priors:    List[torch.Tensor] = []
-    all_syl_feats: List[torch.Tensor] = []
-    all_actions:   List[torch.Tensor] = []   # (N,) int
-    all_log_probs: List[torch.Tensor] = []   # (N,) float
-    all_values:    List[torch.Tensor] = []   # (N,) float
-    all_rewards:   List[torch.Tensor] = []   # (N,) float
+    all_beliefs:     List[torch.Tensor] = []
+    all_priors:      List[torch.Tensor] = []
+    all_syl_feats:   List[torch.Tensor] = []
+    all_distortions: List[Optional[torch.Tensor]] = []  # per-step (1,) or None
+    all_actions:     List[torch.Tensor] = []   # (N,) int
+    all_log_probs:   List[torch.Tensor] = []   # (N,) float
+    all_values:      List[torch.Tensor] = []   # (N,) float
+    all_rewards:     List[torch.Tensor] = []   # (N,) float
 
     hidden: Optional[torch.Tensor] = None
 
@@ -1134,8 +1175,10 @@ def collect_episodes_batched(
         b_t = beliefs_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)  # (N, 1, H)
         p_t = priors_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)   # (N, 1, H)
         s_t = syl_feat_t.unsqueeze(1)                                # (N, 1, 3)
+        d_t = (distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
+               if distortions_K is not None else None)               # (N, 1, 1) or None
 
-        logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden)
+        logits_t, values_t, hidden = agent(b_t, p_t, s_t, hidden, distortion=d_t)
         # logits_t: (N, 1, 2),  values_t: (N, 1, 1)
 
         logits_sq = logits_t.squeeze(1)  # (N, 2)
@@ -1192,6 +1235,7 @@ def collect_episodes_batched(
         all_beliefs.append(beliefs_K[t].cpu())
         all_priors.append(priors_K[t].cpu())
         all_syl_feats.append(syl_feat_t.cpu())
+        all_distortions.append(distortions_K[t].cpu() if distortions_K is not None else None)
         all_actions.append(actions_t.cpu())
         all_log_probs.append(log_probs_t.cpu())
         all_values.append(values_t.squeeze(-1).squeeze(-1).cpu())
@@ -1235,13 +1279,14 @@ def collect_episodes_batched(
         )
         for t in range(K):
             ep.append(Transition(
-                belief   = all_beliefs[t],
-                prior    = all_priors[t],
-                syl_feat = all_syl_feats[t][i],
-                action   = int(all_actions[t][i].item()),
-                log_prob = float(all_log_probs[t][i].item()),
-                value    = float(all_values[t][i].item()),
-                reward   = float(all_rewards[t][i].item()),
+                belief      = all_beliefs[t],
+                prior       = all_priors[t],
+                syl_feat    = all_syl_feats[t][i],
+                action      = int(all_actions[t][i].item()),
+                log_prob    = float(all_log_probs[t][i].item()),
+                value       = float(all_values[t][i].item()),
+                reward      = float(all_rewards[t][i].item()),
+                distortion  = all_distortions[t],
             ))
         episodes.append(ep)
     return episodes

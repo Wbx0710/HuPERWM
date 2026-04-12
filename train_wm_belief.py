@@ -69,7 +69,20 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--evidence-type", choices=["logits", "hidden"], default="logits")
     p.add_argument("--hidden-dim", type=int, default=256)
-    p.add_argument("--pooling-type", choices=["mean", "attention"], default="mean")
+    p.add_argument(
+        "--pooling-type",
+        choices=["mean", "attention", "energy", "boundary_attention"],
+        default="mean",
+    )
+    p.add_argument("--boundary-attn-heads", type=int, default=4,
+                   help="num_heads for BoundaryAwareCrossAttnPool (pooling_type=boundary_attention).")
+    # --- Word Distortion Module (HuperJEPA v2) ---
+    p.add_argument("--use-distortion", action="store_true",
+                   help="Enable WordDistortionModule (v2). Adds distortion loss to Stage 2.")
+    p.add_argument("--distortion-loss-weight", type=float, default=0.5,
+                   help="Weight for distortion alignment loss (default 0.5).")
+    p.add_argument("--distortion-init-threshold", type=float, default=0.3,
+                   help="Initial learnable EMIT threshold (default 0.3).")
     p.add_argument("--upsample-factor", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
 
@@ -463,6 +476,39 @@ class BeliefWMLitModule(pl.LightningModule):
                 loss_dict["sigreg_loss"] = sigreg_loss
                 loss_dict["loss"] = loss_dict["loss"] + sigreg_weight * sigreg_loss
 
+        # --- Word Distortion loss (HuperJEPA v2) ---
+        dist_weight = getattr(self.args, "distortion_loss_weight", 0.0)
+        if (
+            dist_weight > 0
+            and self.model.distortion_module is not None
+            and "distortions" in outputs
+        ):
+            B, K = sm.shape
+            # Build proportional oracle_emit from word count in text — Tier-3 heuristic.
+            # This avoids a circular dependency on CTC alignment (Stage 2 labels).
+            texts = batch.get("texts", [])
+            oracle_emit = sm.new_zeros(B, K)  # float zeros
+            for b_idx, txt in enumerate(texts):
+                n_words = len(txt.strip().split()) if isinstance(txt, str) else 0
+                n_slots = int(sm[b_idx].sum().item())
+                if n_words == 0 or n_slots == 0:
+                    continue
+                step = n_slots / n_words
+                last_slot = -2  # allow emit at slot 0
+                for w in range(n_words):
+                    raw = step * (w + 1) - 1
+                    cand = int(round(raw))
+                    cand = max(cand, last_slot + 2)   # min_gap=2
+                    cand = min(cand, n_slots - 1)
+                    oracle_emit[b_idx, cand] = 1.0
+                    last_slot = cand
+
+            distortion_loss = self.model.distortion_module.distortion_loss(
+                outputs["distortions"], oracle_emit, sm
+            )
+            loss_dict["distortion_loss"] = distortion_loss
+            loss_dict["loss"] = loss_dict["loss"] + dist_weight * distortion_loss
+
         return loss_dict
 
 
@@ -753,6 +799,10 @@ def main() -> None:
         jepa_mask_ratio=args.jepa_mask_ratio,
         jepa_mask_min_span=args.jepa_mask_min_span,
         jepa_mask_max_span=args.jepa_mask_max_span,
+        boundary_attn_heads=args.boundary_attn_heads,
+        use_distortion=args.use_distortion,
+        distortion_loss_weight=args.distortion_loss_weight,
+        distortion_init_threshold=args.distortion_init_threshold,
     )
 
     tts_decoder = None

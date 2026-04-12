@@ -468,6 +468,13 @@ def extract_features(
             sm_i = out["slot_mask"][i, :num_syl].contiguous().cpu()
             canon_logits_i = out["canonical_logits"][i, :up_len].contiguous().cpu()
             up_mask_i = out["up_slot_mask"][i, :up_len].contiguous().cpu()
+            # Word distortion outputs (HuperJEPA v2) — optional.
+            dist_i = None
+            ws_i = None
+            if "distortions" in out:
+                dist_i = out["distortions"][i, :num_syl].contiguous().cpu()  # (K, 1)
+            if "word_states" in out:
+                ws_i = out["word_states"][i, :num_syl].contiguous().cpu()    # (K, H)
 
             oracle_emit, words, word_phone_ids = label_word_boundaries(
                 canon_logits_i, up_mask_i, sm_i, phone_vocab,
@@ -489,6 +496,11 @@ def extract_features(
                 "text": text,
                 "num_slots": num_syl,
             }
+            # Attach distortion outputs if available (HuperJEPA v2).
+            if dist_i is not None:
+                record["distortions"] = dist_i
+            if ws_i is not None:
+                record["word_states"] = ws_i
             current_shard.append(record)
             manifest.append({
                 "segment_id": seg_id,
@@ -665,6 +677,11 @@ class AgentCollator:
         oracle_emit = torch.zeros(B, max_K)
         canonical_logits = torch.zeros(B, max_up, V)
         up_slot_mask = torch.zeros(B, max_up)
+        # Optional distortion / word-state tensors (HuperJEPA v2).
+        has_distortions = "distortions" in batch[0]
+        has_word_states = "word_states" in batch[0]
+        distortions = torch.zeros(B, max_K, 1) if has_distortions else None
+        word_states = torch.zeros(B, max_K, H) if has_word_states else None
 
         for i, it in enumerate(batch):
             K = it["num_slots"]
@@ -676,8 +693,12 @@ class AgentCollator:
             up_len = it["canonical_logits"].shape[0]  # already clipped to K*F
             canonical_logits[i, :up_len] = it["canonical_logits"]
             up_slot_mask[i, :up_len] = it["up_slot_mask"]
+            if distortions is not None and "distortions" in it:
+                distortions[i, :K] = it["distortions"]
+            if word_states is not None and "word_states" in it:
+                word_states[i, :K] = it["word_states"]
 
-        return {
+        out = {
             "segment_ids": [it["segment_id"] for it in batch],
             "beliefs": beliefs,
             "priors": priors,
@@ -688,14 +709,16 @@ class AgentCollator:
             "up_slot_mask": up_slot_mask,
             "words": [it["words"] for it in batch],
             # word_phone_ids: List[List[List[int]]] — [batch][word][phone_id]
-            # Not padded into a tensor: each utterance has a different number of
-            # words and each word has a different number of phones.  Kept as a
-            # nested Python list for direct use in ASRSchedulerEnv.
             "word_phone_ids": [it.get("word_phone_ids", []) for it in batch],
             "texts": [it["text"] for it in batch],
             "num_slots": torch.tensor([it["num_slots"] for it in batch]),
             "upsample_factor": upsample_factor,
         }
+        if distortions is not None:
+            out["distortions"] = distortions   # (B, K, 1)
+        if word_states is not None:
+            out["word_states"] = word_states   # (B, K, H)
+        return out
 
 
 # ---------------------------------------------------------------------------

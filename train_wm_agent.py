@@ -240,7 +240,8 @@ def train_il_epoch(
         # model can learn the timing signal from acoustic context.
         syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)  # (B, K, 3)
 
-        logits, _values, _ = agent(beliefs, priors, syl_feats)  # (B, K, 2)
+        distortions = batch["distortions"].to(device) if "distortions" in batch else None
+        logits, _values, _ = agent(beliefs, priors, syl_feats, distortion=distortions)  # (B, K, 2)
 
         # Cross-entropy on full [WAIT, EMIT] distribution with class weighting.
         actions = oracle.long()  # (B, K): 0=WAIT, 1=EMIT
@@ -321,7 +322,8 @@ def eval_il(
 
         syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)
 
-        logits, _, _ = agent(beliefs, priors, syl_feats)  # (B, K, 2)
+        distortions = batch["distortions"].to(device) if "distortions" in batch else None
+        logits, _, _ = agent(beliefs, priors, syl_feats, distortion=distortions)  # (B, K, 2)
         preds = logits.argmax(dim=-1).float()  # (B, K): argmax over [WAIT, EMIT]
         mask = slot_mask.bool()
         total_correct += ((preds == oracle) & mask).sum()
@@ -424,9 +426,13 @@ def ppo_update(
             olp = ep_old_lp[ep_idx].to(device)                # (T,)
             adv = ep_advantages[ep_idx].to(device)            # (T,)
             ret = ep_returns[ep_idx].to(device)               # (T,)
+            _ep = episodes[ep_idx]
+            _d_list = [t.distortion for t in _ep.transitions]
+            d_ppo = (torch.stack(_d_list).unsqueeze(0).to(device)
+                     if _d_list[0] is not None else None)
 
             # (1,T,2) and (1,T,1) with proper sequential GRU context
-            logits, values_pred, _ = agent(b, p, s)
+            logits, values_pred, _ = agent(b, p, s, distortion=d_ppo)
             logits      = logits.squeeze(0)           # (T, 2)
             values_pred = values_pred.squeeze(0).squeeze(-1)  # (T,)
 
@@ -508,6 +514,8 @@ def evaluate_agent(
             env_cfg=env_cfg,
             oracle_emit=oracle_emit,
             word_phones_list=record.get("word_phone_ids"),
+            distortions=record.get("distortions"),
+            word_states=record.get("word_states"),
         )
 
         # Collect episode; also compute word-match accuracy in parallel.
@@ -587,6 +595,10 @@ def parse_args() -> argparse.Namespace:
                    help="Append 2 extra belief/prior features to the observation: "
                         "cosine_sim(belief, prior) and entropy(softmax(belief)). "
                         "Requires re-training from IL since the input dimension changes.")
+    p.add_argument("--use-distortion", action="store_true",
+                   help="Append 1 distortion scalar to the observation (HuperJEPA v2). "
+                        "Requires agent data extracted from a --use-distortion Stage 2 "
+                        "checkpoint (distortions field must be present).")
 
     # IL hyperparameters
     p.add_argument("--il-epochs", type=int, default=30)
@@ -773,6 +785,7 @@ def main() -> None:
         gru_layers=args.gru_layers,
         dropout=args.agent_dropout,
         use_extra_features=getattr(args, "use_extra_features", False),
+        use_distortion=getattr(args, "use_distortion", False),
     )
     agent_raw = SchedulerAgent(cfg).to(device)
 
@@ -976,6 +989,8 @@ def main() -> None:
                     env_cfg=env_cfg,
                     oracle_emit=record.get("oracle_emit"),
                     word_phones_list=record.get("word_phone_ids"),
+                    distortions=record.get("distortions"),
+                    word_states=record.get("word_states"),
                 )
 
                 # Use a single batched forward (batch=1 for PPO, but the
@@ -1160,6 +1175,8 @@ def main() -> None:
                     env_cfg=env_cfg,
                     oracle_emit=record.get("oracle_emit"),
                     word_phones_list=record.get("word_phone_ids"),
+                    distortions=record.get("distortions"),
+                    word_states=record.get("word_states"),
                 )
                 # Batched rollout: all grpo_rollouts run in a single
                 # batch=grpo_rollouts GPU forward per time step.
