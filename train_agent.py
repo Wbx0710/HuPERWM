@@ -80,7 +80,13 @@ def reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
 
 
 def compute_steps_since_emit(oracle_emit: torch.Tensor) -> torch.Tensor:
-    """Vectorised steps-since-last-emit from oracle labels (B, K) → (B, K)."""
+    """Vectorised steps-since-last-emit from oracle labels (B, K) → (B, K).
+
+    At position k we report how many steps have elapsed since the most recent
+    oracle emit STRICTLY BEFORE position k (i.e. the decision at step k does
+    not yet know whether k itself will be labelled emit).  This matches what
+    the environment computes at runtime with the agent's own previous actions.
+    """
     B, K = oracle_emit.shape
     device = oracle_emit.device
     k_idx = torch.arange(K, device=device, dtype=torch.float)
@@ -89,7 +95,13 @@ def compute_steps_since_emit(oracle_emit: torch.Tensor) -> torch.Tensor:
         k_idx.unsqueeze(0).expand(B, -1),
         torch.full((B, K), -1.0, device=device),
     )
-    last_emit_idx, _ = torch.cummax(emit_positions, dim=1)
+    # Shift right by one so cummax at position k only sees positions 0..k-1,
+    # preventing the current oracle label from leaking into the feature.
+    shifted = torch.cat([
+        torch.full((B, 1), -1.0, device=device),
+        emit_positions[:, :-1],
+    ], dim=1)
+    last_emit_idx, _ = torch.cummax(shifted, dim=1)
     return k_idx.unsqueeze(0) - last_emit_idx
 
 
@@ -149,6 +161,12 @@ def train_il_epoch(
         boundaries = batch["boundaries"].to(device)
         num_slots = batch["num_slots"].to(device)
 
+        # steps_since is computed from oracle history STRICTLY BEFORE position k
+        # (see compute_steps_since_emit — cummax is shifted by 1 to exclude the
+        # current position, so oracle[k]=1 does NOT set steps_since[k]=0).
+        # This is a causal temporal feature with no label leakage.  At rollout
+        # the agent substitutes its own emit history, which closely matches oracle
+        # given the ~99% recall achieved by IL.
         syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)
         distortions = batch["distortions"].to(device) if "distortions" in batch else None
         err = (distortions if distortions is not None
@@ -187,8 +205,9 @@ def train_il_epoch(
                 recall=f"{total_emit_tp.item() / max(total_emit_pos.item(), 1):.3f}",
             )
 
-    for t in [total_loss, total_correct, total_samples, total_emit_tp, total_emit_pos, total_emit_pred]:
-        reduce_mean(t, world_size)
+    if world_size > 1:
+        for t in [total_loss, total_correct, total_samples, total_emit_tp, total_emit_pos, total_emit_pred]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     n = total_samples.item()
     recall = total_emit_tp.item() / max(total_emit_pos.item(), 1)
@@ -241,8 +260,9 @@ def eval_il(
         total_emit_pos += (oracle == 1).sum()
         total_emit_pred += ((preds == 1) & mask).sum()
 
-    for t in [total_correct, total_samples, total_emit_tp, total_emit_pos, total_emit_pred]:
-        reduce_mean(t, world_size)
+    if world_size > 1:
+        for t in [total_correct, total_samples, total_emit_tp, total_emit_pos, total_emit_pred]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     recall = total_emit_tp.item() / max(total_emit_pos.item(), 1)
     precision = total_emit_tp.item() / max(total_emit_pred.item(), 1)

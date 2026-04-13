@@ -1,5 +1,4 @@
 #!/bin/bash
-# Usage: [CUDA_VISIBLE_DEVICES=0] bash scripts/extract_agent_data.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

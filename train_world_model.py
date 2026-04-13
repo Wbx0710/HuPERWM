@@ -222,10 +222,14 @@ class WorldModelLitModule(pl.LightningModule):
         future_loss = ev.new_zeros(())
         if outputs["future_pred"].shape[1] > 1:
             fm = sm[:, 1:].unsqueeze(-1)
+            # Predict the next belief (same representation space as the input),
+            # rather than the next raw slot.  Slots and beliefs diverge in space
+            # as training progresses, causing slot-target future_mse to rise
+            # monotonically even as phoneme quality improves.
             future_loss = (
                 F.mse_loss(
                     outputs["future_pred"][:, :-1] * fm,
-                    outputs["slots"][:, 1:].detach() * fm,
+                    outputs["beliefs"][:, 1:].detach() * fm,
                     reduction="sum",
                 )
                 / (fm.sum().clamp_min(1.0) * H)
@@ -344,34 +348,33 @@ class FullEvalCallback(Callback):
         epoch = trainer.current_epoch + 1
         if epoch % self.every != 0 and epoch != trainer.max_epochs:
             return
-        if not trainer.is_global_zero:
-            return
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        base_ckpt = {
-            "model_state_dict": pl_module.model.state_dict(),
-            "config": pl_module.model.config,
-            "epoch": epoch,
-        }
-        torch.save({**base_ckpt, "history": self.history}, self.output_dir / "last.pt")
+        if trainer.is_global_zero:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            base_ckpt = {
+                "model_state_dict": pl_module.model.state_dict(),
+                "config": pl_module.model.config,
+                "epoch": epoch,
+            }
+            torch.save({**base_ckpt, "history": self.history}, self.output_dir / "last.pt")
 
-        metrics = evaluate_belief_wm(pl_module.model, self.val_loader, self.phone_vocab, pl_module.device)
-        record = {"epoch": epoch, **metrics}
-        self.history.append(record)
-        print(json.dumps(record, ensure_ascii=True), flush=True)
+            metrics = evaluate_belief_wm(pl_module.model, self.val_loader, self.phone_vocab, pl_module.device)
+            record = {"epoch": epoch, **metrics}
+            self.history.append(record)
+            print(json.dumps(record, ensure_ascii=True), flush=True)
 
-        base_ckpt["metrics"] = metrics
-        torch.save({**base_ckpt, "history": self.history}, self.output_dir / "last.pt")
+            base_ckpt["metrics"] = metrics
+            torch.save({**base_ckpt, "history": self.history}, self.output_dir / "last.pt")
 
-        if metrics["canonical_per"] < self.best_canonical_per:
-            self.best_canonical_per = metrics["canonical_per"]
-            self._epochs_without_improve = 0
-            torch.save(base_ckpt, self.output_dir / "best.pt")
-        else:
-            self._epochs_without_improve += self.every
-            if self.patience > 0 and self._epochs_without_improve >= self.patience:
-                print(f"[epoch {epoch}] Early stopping after {self._epochs_without_improve} epochs.", flush=True)
-                trainer.should_stop = True
+            if metrics["canonical_per"] < self.best_canonical_per:
+                self.best_canonical_per = metrics["canonical_per"]
+                self._epochs_without_improve = 0
+                torch.save(base_ckpt, self.output_dir / "best.pt")
+            else:
+                self._epochs_without_improve += self.every
+                if self.patience > 0 and self._epochs_without_improve >= self.patience:
+                    print(f"[epoch {epoch}] Early stopping after {self._epochs_without_improve} epochs.", flush=True)
+                    trainer.should_stop = True
 
         if trainer.world_size > 1:
             trainer.strategy.barrier("eval_checkpoint")
