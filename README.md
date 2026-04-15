@@ -18,51 +18,14 @@ The pipeline has two stages:
 
 ---
 
-## Architecture
-
-### Belief World Model
-
-```
-Evidence (B, T, 1024)  ← HuPER last hidden states
-    └─ evidence_proj (MLP) ──► (B, T, H)
-           └─ SyllableSlotPooler (boundary cross-attn + causal slot attn)
-                  └─ slots (B, K, H)
-                         └─ ComparisonRefinementEncoder
-                                ├─ CausalConformer → priors (B, K, H)
-                                └─ N × refinement blocks
-                                       signed error = belief − prior
-                                       gated fusion + Conformer update
-                                   → beliefs (B, K, H)
-```
-
-**Training losses:** frame-phone CTC + evidence CTC + canonical CTC + future-belief MSE + reconstruction MSE + optional SIGReg / convergence / diversity.
-
-### Active Agent
-
-```
-belief  ──► hypothesis_proj ──────────────────► h_top  (B-path: top-down)
-prior + syl_feat ──► evidence_encoder ──► GRU ► h_bot  (C-path: bottom-up)
-error ──► comparison_gate (sigmoid) ──► gate
-h_fused = gate · h_bot + (1 − gate) · h_top
-    ├─► policy_head → logits (WAIT / EMIT)
-    └─► value_head  → V(s)
-```
-
-Low error (belief ≈ prior) → gate ≈ 0 → trust hypothesis → **EMIT**.  
-High error (belief ≠ prior) → gate ≈ 1 → gather more evidence → **WAIT**.
-
----
-
 ## Installation
 
 ```bash
-git clone https://github.com/Wbx0710/HuPERWM.git
+git clone https://github.com/Bixing-Wu/HuPERWM
 cd HuPERWM
 conda env create -f environment.yml
 conda activate huperwm
 ```
-
-For CUDA 11.8 GPUs, replace the two `cu124` lines in `environment.yml` with their `cu118` equivalents before running the above.
 
 After activating, download required NLTK data once:
 
@@ -77,17 +40,17 @@ nltk.download("cmudict")
 
 The world model expects pre-extracted features stored as per-segment `.pt` files.
 
-### Pre-extracted data on lexi (skip extraction if you have server access)
+### Pre-extracted data on lexi
 
-All features and checkpoints are already available on the **lexi** server under `/data/bixingwu/`. Contact the author to get read access (`chmod` will be set on request).
+All features and checkpoints are already available on the **lexi** server under `/data/bixingwu/`.
 
-| Path | Size | Description |
-|---|---|---|
-| `/data/bixingwu/huperworldmodel/artifacts/wm_features_librispeech/` | ~146 G | HuPER hidden states + Sylber boundaries for LibriSpeech train-clean-360 & validation-clean |
-| `/data/bixingwu/huperworldmodel/artifacts/metadata_librispeech/` | — | Phone/text vocab + per-utterance metadata (`train.jsonl`, `validation.jsonl`) |
-| `/data/bixingwu/agent_data_v2/` | ~21 G | Pre-extracted agent features (beliefs, priors, distortion vectors, oracle labels) from `wm_v4/best.pt` |
-| `/data/bixingwu/runs/wm_v4/` | — | Trained world model checkpoint (`best.pt`, `last.pt`, `eval_history.json`) |
-| `/data/bixingwu/runs/agent_grpo_v7/` | — | Trained agent checkpoints (`il_best.pt`, `grpo_best.pt`) and training config |
+| Path | Description |
+|---|---|
+| `/data/bixingwu/huperworldmodel/artifacts/wm_features_librispeech/` | HuPER hidden states + Sylber boundaries for LibriSpeech train-clean-360 & validation-clean |
+| `/data/bixingwu/huperworldmodel/artifacts/metadata_librispeech/` | Phone/text vocab + per-utterance metadata (`train.jsonl`, `validation.jsonl`) |
+| `/data/bixingwu/agent_data_v2/` | Pre-extracted agent features (beliefs, priors, distortion vectors, oracle labels) from `wm_v4/best.pt` |
+| `/data/bixingwu/runs/wm_v4/` | Trained world model checkpoint (`best.pt`, `last.pt`, `eval_history.json`) |
+| `/data/bixingwu/runs/agent_grpo_v7/` | Trained agent checkpoints (`il_best.pt`, `grpo_best.pt`) and training config |
 
 If you are on lexi, you can skip Steps 1–2 below and point `--features-dir`, `--metadata-dir`, and `--agent-data-dir` directly at these paths.
 
@@ -112,7 +75,7 @@ If you are on lexi, you can skip Steps 1–2 below and point `--features-dir`, `
     └── agent_grpo_v7/      # agent checkpoint
 ```
 
-### Extracting features from scratch (if not on lexi)
+### Extracting features from scratch
 
 HuPER and Sylber are loaded automatically from HuggingFace. For offline pre-extraction use `OnlineLibriSpeechWMDataset` (in `huperwm/data/online.py`) or call the models directly:
 
@@ -132,13 +95,6 @@ segmenter = Segmenter(device="cuda")
 ### Step 1 — Train the World Model
 
 ```bash
-# Single GPU
-python train_world_model.py \
-    --features-dir /path/to/wm_features_librispeech \
-    --metadata-dir /path/to/metadata_librispeech \
-    --output-dir   runs/wm \
-    --evidence-type hidden --epochs 150
-
 # Multi-GPU (DDP)
 CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/train_world_model.sh
 ```
@@ -157,13 +113,6 @@ Key flags:
 
 ```bash
 bash scripts/extract_agent_data.sh
-# or:
-python extract_agent_data.py \
-    --checkpoint  runs/wm/best.pt \
-    --features-dir /path/to/wm_features_librispeech \
-    --metadata-dir /path/to/metadata_librispeech \
-    --output-dir   /path/to/agent_data \
-    --splits train validation --evidence-type hidden
 ```
 
 ### Step 3 — Train the Agent
@@ -189,7 +138,7 @@ GRPO key flags:
 ## Results
 
 Trained on LibriSpeech `train-clean-360`, evaluated on `validation-clean`.  
-Reference checkpoints and full training logs are on **lexi** at `/data/bixingwu/runs/` (contact the author to request read access).
+Reference checkpoints and full training logs are on **lexi** at `/data/bixingwu/runs/`.
 
 ### World Model (`wm_v4`)
 
@@ -212,7 +161,7 @@ Training config: `/data/bixingwu/runs/agent_grpo_v7/agent_train_args.json`
 
 ## POMDP Extension (`pomdp` branch)
 
-The `pomdp` branch extends the main codebase with a full POMDP formulation. It is experimental and not yet fully evaluated.
+The `pomdp` branch extends the main codebase with a full POMDP(https://en.wikipedia.org/wiki/Partially_observable_Markov_decision_process) formulation. It is experimental and not yet fully evaluated.
 
 Key changes relative to `main`:
 
