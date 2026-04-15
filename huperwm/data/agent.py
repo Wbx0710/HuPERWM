@@ -400,8 +400,9 @@ class AgentCollator:
         oracle_emit = torch.zeros(B, max_K)
         canonical_logits = torch.zeros(B, max_up, V)
         up_slot_mask = torch.zeros(B, max_up)
-        has_distortions = "distortions" in batch[0]
-        distortions = torch.zeros(B, max_K, 1) if has_distortions else None
+        has_dist_vecs = "distortion_vectors" in batch[0]
+        H = batch[0]["beliefs"].shape[-1]
+        distortion_vectors = torch.zeros(B, max_K, H) if has_dist_vecs else None
 
         for i, it in enumerate(batch):
             K = it["num_slots"]
@@ -413,8 +414,8 @@ class AgentCollator:
             up_len = it["canonical_logits"].shape[0]
             canonical_logits[i, :up_len] = it["canonical_logits"]
             up_slot_mask[i, :up_len] = it["up_slot_mask"]
-            if distortions is not None and "distortions" in it:
-                distortions[i, :K] = it["distortions"]
+            if distortion_vectors is not None and "distortion_vectors" in it:
+                distortion_vectors[i, :K] = it["distortion_vectors"]
 
         out = {
             "segment_ids": [it["segment_id"] for it in batch],
@@ -431,8 +432,8 @@ class AgentCollator:
             "num_slots": torch.tensor([it["num_slots"] for it in batch]),
             "upsample_factor": upsample_factor,
         }
-        if distortions is not None:
-            out["distortions"] = distortions
+        if distortion_vectors is not None:
+            out["distortion_vectors"] = distortion_vectors
         return out
 
 
@@ -488,9 +489,9 @@ def extract_agent_features(
             sm_i = out["slot_mask"][i, :num_syl].contiguous().cpu()
             canon_logits_i = out["canonical_logits"][i, :up_len].contiguous().cpu()
             up_mask_i = out["up_slot_mask"][i, :up_len].contiguous().cpu()
-            dist_i = None
-            if "distortions" in out:
-                dist_i = out["distortions"][i, :num_syl].contiguous().cpu()
+            dist_vec_i = None
+            if "distortion_vectors" in out:
+                dist_vec_i = out["distortion_vectors"][i, :num_syl].contiguous().cpu()
 
             oracle_emit, words, word_phone_ids = label_word_boundaries(
                 canon_logits_i, up_mask_i, sm_i, phone_vocab, upsample_factor, text,
@@ -511,8 +512,8 @@ def extract_agent_features(
                 "text": text,
                 "num_slots": num_syl,
             }
-            if dist_i is not None:
-                record["distortions"] = dist_i
+            if dist_vec_i is not None:
+                record["distortion_vectors"] = dist_vec_i
 
             current_shard.append(record)
             manifest.append({

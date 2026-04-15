@@ -1,14 +1,17 @@
 """Belief World Model — v3 architecture.
 
 Evidence (HuPER hidden states, 1024-dim) → SyllableSlotPooler → slots
-    → ComparisonRefinementEncoder → beliefs, priors, errors
+    → ComparisonRefinementEncoder → beliefs, priors, distortion_vectors
 
 Read-out heads (shared):
-    frame_phone_head   — frame-level phone CTC (evidence + belief context)
+    frame_phone_head    — frame-level phone CTC (evidence + belief context)
     evidence_phone_head — slot-level CTC on raw slots
-    canonical_head     — slot-level CTC on priors (canonical phones)
-    future_head        — next-slot prediction auxiliary
-    recon_head         — slot reconstruction auxiliary
+    canonical_head      — slot-level CTC on priors (canonical phones)
+    future_head         — next-slot prediction auxiliary
+    recon_head          — slot reconstruction auxiliary
+
+POMDP extensions (gated by config):
+    belief_var_weight > 0 — enables KL divergence loss from belief_logvar_head
 """
 
 from __future__ import annotations
@@ -57,6 +60,9 @@ class WorldModelConfig:
     belief_grad_scale: float = 0.1
     frame_phone_dropout: float = 0.1
     canonical_head_dropout: float = 0.0
+
+    # POMDP extension: VAE-style belief variance (gated — 0.0 = disabled)
+    belief_var_weight: float = 0.0
 
 
 class SlotUpsampler(nn.Module):
@@ -138,6 +144,7 @@ class BeliefWorldModel(nn.Module):
             refinement_conv_kernel=config.refinement_conv_kernel,
             dropout=config.dropout,
             convergence_loss_weight=config.convergence_loss_weight,
+            use_belief_var=(config.belief_var_weight > 0.0),
         )
         self.encoder = ComparisonRefinementEncoder(enc_cfg)
 
@@ -170,8 +177,9 @@ class BeliefWorldModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Frozen inference for the RL agent — returns per-slot features.
 
-        Skips training-only heads; includes distortions (= final comparison error)
-        so the ActiveAgent can use the convergence signal.
+        Skips training-only heads; includes distortion_vectors (H-dim per-dimension
+        signed error between belief and prior) as the primary uncertainty signal
+        for the ActiveAgent's comparison gate.
         """
         out = self.forward(evidence, boundaries, slot_mask, num_frames, frame_mask=frame_mask)
         result = {
@@ -181,9 +189,10 @@ class BeliefWorldModel(nn.Module):
             "slot_mask": out["slot_mask"],
             "canonical_logits": out["canonical_logits"],
             "up_slot_mask": out["up_slot_mask"],
-            "distortions": out["distortions"],        # (B, K, 1) final comparison error
-            "comparison_errors": out["comparison_errors"],
+            "distortion_vectors": out["distortion_vectors"],  # (B, K, H) per-dim error
         }
+        if out.get("belief_logvar") is not None:
+            result["belief_logvar"] = out["belief_logvar"]
         return result
 
     def forward(
@@ -199,10 +208,10 @@ class BeliefWorldModel(nn.Module):
         projected = self.evidence_proj(evidence)  # (B, T, H)
         slots = self.pooling(projected, boundaries, slot_mask)  # (B, K, H)
 
-        beliefs, priors, errors = self.encoder(slots, slot_mask)
+        beliefs, priors, error_vectors, belief_logvar = self.encoder(slots, slot_mask)
 
-        # Final comparison error serves as the distortion / convergence signal.
-        distortions = errors[-1]  # (B, K, 1)
+        # Per-dim distortion vector: directional uncertainty signal for the agent.
+        distortion_vectors = error_vectors[-1]  # (B, K, H)
 
         # Frame-phone head: broadcast beliefs back to frame resolution.
         belief_frames = broadcast_to_frames(beliefs, boundaries, slot_mask, T)
@@ -217,18 +226,56 @@ class BeliefWorldModel(nn.Module):
         up_beliefs, _ = self.upsampler(beliefs, slot_mask)
         up_priors, _ = self.upsampler(priors, slot_mask)
 
-        return {
+        out: Dict[str, torch.Tensor] = {
             "slots": slots,
             "beliefs": beliefs,
             "priors": priors,
             "belief_frames": belief_frames,
             "slot_mask": slot_mask,
             "up_slot_mask": up_mask,
-            "distortions": distortions,
-            "comparison_errors": errors,
+            "distortion_vectors": distortion_vectors,
+            # comparison_errors (list of H-dim error_vectors) used by convergence_loss.
+            "comparison_errors": error_vectors,
             "frame_phone_logits": self.frame_phone_head(augmented),
             "evidence_phone_logits": self.evidence_phone_head(up_slots),
             "canonical_logits": self.canonical_head(up_priors),
             "future_pred": self.future_head(beliefs),
             "evidence_recon": self.recon_head(beliefs),
         }
+        if belief_logvar is not None:
+            out["belief_logvar"] = belief_logvar
+        return out
+
+    def belief_kl_loss(
+        self,
+        beliefs: torch.Tensor,
+        priors: torch.Tensor,
+        belief_logvar: torch.Tensor,
+        slot_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """KL[ q(z|slots) || p(z|prior) ] with prior treated as N(prior, I).
+
+        Uses the analytic KL between two Gaussians:
+            KL = 0.5 * ( logvar_p - logvar_q + exp(logvar_q - logvar_p)
+                         + (mu_q - mu_p)^2 / exp(logvar_p) - 1 )
+        With logvar_p = 0 (unit variance prior) this simplifies to:
+            KL = 0.5 * ( -logvar_q + exp(logvar_q) + (belief - prior)^2 - 1 )
+
+        Args:
+            beliefs:      (B, K, H) — posterior mean.
+            priors:       (B, K, H) — prior mean (treated as N(prior, I)).
+            belief_logvar:(B, K, H) — posterior log-variance.
+            slot_mask:    (B, K)    — 1 for valid slots.
+
+        Returns:
+            Scalar KL loss averaged over valid slots and dimensions.
+        """
+        kl = 0.5 * (
+            -belief_logvar
+            + belief_logvar.exp()
+            + (beliefs - priors).pow(2)
+            - 1.0
+        )  # (B, K, H)
+        mask = slot_mask.unsqueeze(-1)  # (B, K, 1)
+        n_valid = mask.sum().clamp(min=1) * beliefs.shape[-1]
+        return (kl * mask).sum() / n_valid

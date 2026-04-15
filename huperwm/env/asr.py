@@ -1,15 +1,36 @@
-"""ASR Scheduler Environment and GRPO rollout utilities.
+"""ASR Scheduler Environment and policy-gradient rollout utilities.
 
-The environment steps through syllable slots left-to-right.  On each step the
-ActiveAgent receives (belief, prior, syl_feat, error) and outputs a WAIT/EMIT
-action.  On EMIT, CTC logits accumulated since the last emit are decoded and
-compared against the expected ground-truth word (word_match mode).
+The environment steps through syllable slots left-to-right. On each step the
+ActiveAgent receives (belief, prior, syl_feat, error_vec, prev_action) and
+outputs a WAIT/EMIT action.  On EMIT, CTC logits accumulated since the last
+emit are decoded and compared against the expected ground-truth word
+(word_match mode).
 
 Reward modes:
     "per_slot"   — per-step binary reward against oracle slots.
     "episode_f1" — zero step rewards; terminal F1 against oracle.
     "hybrid"     — small per-step credit (±0.2) + terminal F1.
     "word_match" — acoustic word recognition: (1 − phonePER) per EMIT.
+
+POMDP extensions:
+    info_gain_scale > 0 — WAIT receives a bonus reward proportional to the
+        decrease in L2 distortion norm from the current slot to the next,
+        implementing the POMDP principle that information-gathering actions
+        have intrinsic value.
+
+Update algorithm (grpo_update):
+    Group Relative Policy Optimization + Generalized Advantage Estimation.
+    G rollouts of the same utterance form a group.  Per-step advantages are
+    computed via GAE (Schulman et al. 2016) using the value_head predictions,
+    then group-normalised to remove utterance-level difficulty bias.  A value
+    function loss (MSE) trains the critic alongside the policy.
+
+    Per-step GAE is superior to episode-level GRPO for long sequences with
+    sparse rewards: each WAIT/EMIT decision gets its own credit-assigned
+    advantage, and the value baseline reduces variance at every step.
+    Reference: Ni et al. (2022) "Recurrent Model-Free RL Can Be a Strong
+    Baseline for Many POMDPs" — confirms GRU + GAE matches specialised POMDP
+    algorithms on 18/21 benchmarks.
 """
 
 from __future__ import annotations
@@ -45,6 +66,8 @@ class EnvConfig:
     f1_reward_scale: float = 1.0
     f1_match_window: int = 0
     missing_word_penalty: float = 0.5
+    # POMDP: reward WAIT when distortion norm decreases (information gathering).
+    info_gain_scale: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +84,8 @@ class Transition:
     log_prob: float
     value: float
     reward: float
-    error: Optional[torch.Tensor] = None   # (1,) comparison convergence signal
+    error: Optional[torch.Tensor] = None  # (H,) distortion vector
+    prev_action: Optional[int] = None     # action taken at previous step
 
 
 @dataclass
@@ -139,7 +163,7 @@ class ASRSchedulerEnv:
         env_cfg: EnvConfig | None = None,
         oracle_emit: torch.Tensor | None = None,
         word_phones_list: Optional[List[List[int]]] = None,
-        distortions: torch.Tensor | None = None,  # (K, 1) comparison errors
+        distortion_vectors: torch.Tensor | None = None,  # (K, H) per-dim errors
     ) -> None:
         self.beliefs = beliefs
         self.priors = priors
@@ -152,7 +176,7 @@ class ASRSchedulerEnv:
         self.cfg = env_cfg or EnvConfig()
         self.oracle_emit = oracle_emit
         self.word_phones_list: List[List[int]] = word_phones_list or []
-        self.distortions = distortions
+        self.distortion_vectors = distortion_vectors
 
         self.num_slots = int(slot_mask.sum().item())
         self.upsample_factor = self.cfg.upsample_factor
@@ -176,6 +200,7 @@ class ASRSchedulerEnv:
         self.emitted_words: List[str] = []
         self.agent_emit_slots: List[int] = []
         self.done = False
+        self.last_action: int = WAIT
 
     def _decode_buffer(self) -> str:
         start_frame = self.emit_start_slot * self.upsample_factor
@@ -199,12 +224,28 @@ class ASRSchedulerEnv:
         steps_since = torch.tensor(self.t - self.emit_start_slot, device=device, dtype=torch.float)
         return torch.stack([log_dur, rel_pos, steps_since])
 
-    def observe(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Return (belief_t, prior_t, syl_feat_t, error_t)."""
-        error_t: torch.Tensor | None = None
-        if self.distortions is not None and self.t < self.distortions.shape[0]:
-            error_t = self.distortions[self.t]  # (1,)
-        return self.beliefs[self.t], self.priors[self.t], self._compute_syl_feat(), error_t
+    def _get_error(self) -> torch.Tensor | None:
+        """Return distortion_vectors[t] (H-dim) or None."""
+        if self.distortion_vectors is not None and self.t < self.distortion_vectors.shape[0]:
+            return self.distortion_vectors[self.t]  # (H,)
+        return None
+
+    def observe(self) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor | None, int,
+    ]:
+        """Return (belief_t, prior_t, syl_feat_t, error_t, prev_action).
+
+        prev_action is the action taken at step t-1 (WAIT=0 at t=0).
+        error_t is H-dim distortion vector or None.
+        """
+        return (
+            self.beliefs[self.t],
+            self.priors[self.t],
+            self._compute_syl_feat(),
+            self._get_error(),
+            self.last_action,
+        )
 
     @staticmethod
     def _normalize_phone(ph: str) -> str:
@@ -264,6 +305,16 @@ class ASRSchedulerEnv:
         f1 = 2.0 * precision * recall / max(precision + recall, 1e-8)
         return f1 * self.cfg.f1_reward_scale
 
+    def _info_gain_reward(self) -> float:
+        """POMDP information gain: reward WAIT when distortion norm decreases next step."""
+        if self.cfg.info_gain_scale <= 0.0 or self.distortion_vectors is None:
+            return 0.0
+        if self.t + 1 >= self.distortion_vectors.shape[0]:
+            return 0.0
+        d_now = self.distortion_vectors[self.t].norm().item()
+        d_next = self.distortion_vectors[self.t + 1].norm().item()
+        return self.cfg.info_gain_scale * max(0.0, d_now - d_next)
+
     def step(self, action: int) -> Tuple[float, bool]:
         """Execute action, return (reward, done)."""
         if self.done:
@@ -300,10 +351,13 @@ class ASRSchedulerEnv:
                 else:
                     reward = self.cfg.wrong_penalty
             self.emit_start_slot = self.t + 1
-        else:
+        else:  # WAIT
             if mode == "per_slot":
                 reward = self.cfg.wait_penalty
+            # POMDP: information-gathering bonus for WAIT when uncertainty decreases.
+            reward += self._info_gain_reward()
 
+        self.last_action = action
         self.t += 1
         if self.t >= self.num_slots:
             self.done = True
@@ -328,7 +382,11 @@ def collect_episode(
     device: torch.device,
     temperature: float = 1.0,
 ) -> EpisodeBuffer:
-    """Roll out one episode sequentially (batch=1)."""
+    """Roll out one episode sequentially (batch=1).
+
+    Inputs to the agent are shaped (1, dim) — 2D — matching the squeeze path
+    in ActiveAgent.forward() which handles single-step input without a time axis.
+    """
     agent.eval()
     env.reset()
     buf = EpisodeBuffer(
@@ -338,15 +396,19 @@ def collect_episode(
     hidden = None
 
     while not env.done:
-        belief, prior, syl_feat, error_obs = env.observe()
-        b = belief.unsqueeze(0).to(device)
-        p = prior.unsqueeze(0).to(device)
-        s = syl_feat.unsqueeze(0).to(device)
-        err = (error_obs.unsqueeze(0).to(device)
-               if error_obs is not None else torch.zeros(1, 1, device=device))
+        belief, prior, syl_feat, error_obs, prev_act = env.observe()
+        b = belief.unsqueeze(0).to(device)      # (1, H)
+        p = prior.unsqueeze(0).to(device)       # (1, H)
+        s = syl_feat.unsqueeze(0).to(device)    # (1, 3)
+        err = (
+            error_obs.unsqueeze(0).to(device)   # (1, H)
+            if error_obs is not None
+            else torch.zeros(1, agent.cfg.belief_dim, device=device)
+        )
+        prev_action_t = torch.tensor([prev_act], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            logits, value_t, hidden = agent(b, p, s, err, hidden)
+            logits, value_t, hidden = agent(b, p, s, err, hidden, prev_action_t)
         logits = logits.squeeze(0)
         dist = torch.distributions.Categorical(logits=logits / temperature)
         action = dist.sample().item()
@@ -357,7 +419,7 @@ def collect_episode(
         buf.append(Transition(
             belief=belief, prior=prior, syl_feat=syl_feat,
             action=action, log_prob=log_prob, value=value, reward=reward,
-            error=error_obs,
+            error=error_obs, prev_action=prev_act,
         ))
 
     return buf
@@ -374,11 +436,17 @@ def _collect_word_match_batched(
     """Batched rollout for word_match mode: N rollouts in a single forward per step."""
     K = env.num_slots
     N = n_rollouts
+    H = agent.cfg.belief_dim
 
     beliefs_K = env.beliefs[:K].to(device)
     priors_K = env.priors[:K].to(device)
     bnd = env.boundaries[:K].to(device)
-    distortions_K = (env.distortions[:K].to(device) if env.distortions is not None else None)
+
+    distortions_K = (
+        env.distortion_vectors[:K].to(device)  # (K, H)
+        if env.distortion_vectors is not None
+        else None
+    )
 
     durations = (bnd[:, 1] - bnd[:, 0]).float().clamp(min=1.0).log()
     rel_pos = torch.arange(K, device=device).float() / max(K - 1, 1)
@@ -392,7 +460,6 @@ def _collect_word_match_batched(
 
     slot_sf = [t * F_up for t in range(K)]
     slot_ef = [(t + 1) * F_up for t in range(K)]
-    slot_vlen = [int(up_slot_mask[slot_sf[t]:slot_ef[t]].sum().item()) for t in range(K)]
 
     total_gt_words = env.total_gt_words
     word_phones_list = env.word_phones_list
@@ -403,11 +470,13 @@ def _collect_word_match_batched(
     steps_since = torch.zeros(N, device=device)
     emit_start = [0] * N
     gt_idx = [0] * N
+    prev_actions = torch.zeros(N, dtype=torch.long, device=device)
 
     s_beliefs: List[torch.Tensor] = []
     s_priors: List[torch.Tensor] = []
     s_syl_feats: List[torch.Tensor] = []
     s_errors: List[Optional[torch.Tensor]] = []
+    s_prev_actions: List[torch.Tensor] = []
     s_actions: List[torch.Tensor] = []
     s_log_probs: List[torch.Tensor] = []
     s_values: List[torch.Tensor] = []
@@ -420,10 +489,16 @@ def _collect_word_match_batched(
         b_t = beliefs_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
         p_t = priors_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
         s_t = syl_feat_t.unsqueeze(1)
-        d_t = (distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
-               if distortions_K is not None else torch.zeros(N, 1, 1, device=device))
 
-        logits_t, values_t, hidden = agent(b_t, p_t, s_t, d_t, hidden)
+        d_t = (
+            distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)  # (N, 1, H)
+            if distortions_K is not None
+            else torch.zeros(N, 1, H, device=device)
+        )
+
+        prev_act_t = prev_actions.unsqueeze(1)
+
+        logits_t, values_t, hidden = agent(b_t, p_t, s_t, d_t, hidden, prev_act_t)
         logits_sq = logits_t.squeeze(1)
         sample_dist = torch.distributions.Categorical(logits=logits_sq / temperature)
         actions_t = sample_dist.sample()
@@ -468,6 +543,12 @@ def _collect_word_match_batched(
                 else:
                     r = cfg.wrong_penalty
                 emit_start[n] = t + 1
+            else:
+                # POMDP: info gain reward for WAIT when distortion norm decreases.
+                if cfg.info_gain_scale > 0.0 and distortions_K is not None and t + 1 < K:
+                    d_now = distortions_K[t].norm().item()
+                    d_next = distortions_K[t + 1].norm().item()
+                    r += cfg.info_gain_scale * max(0.0, d_now - d_next)
 
             if is_last and gt_idx[n] < total_gt_words:
                 r -= cfg.missing_word_penalty * (total_gt_words - gt_idx[n])
@@ -480,11 +561,14 @@ def _collect_word_match_batched(
         s_priors.append(priors_K[t].cpu())
         s_syl_feats.append(syl_feat_t.cpu())
         s_errors.append(distortions_K[t].cpu() if distortions_K is not None else None)
+        s_prev_actions.append(prev_actions.cpu())
         s_actions.append(actions_t.cpu())
         s_log_probs.append(log_probs_t.cpu())
         s_values.append(values_t.squeeze(-1).squeeze(-1).cpu())
         for n in range(N):
             s_rewards[n].append(rewards_step[n])
+
+        prev_actions = actions_t.clone()
 
     buffers: List[EpisodeBuffer] = []
     for n in range(N):
@@ -500,6 +584,7 @@ def _collect_word_match_batched(
                 value=s_values[t][n].item(),
                 reward=s_rewards[n][t],
                 error=err_t,
+                prev_action=s_prev_actions[t][n].item(),
             ))
         buffers.append(buf)
     return buffers
@@ -523,11 +608,17 @@ def collect_episodes_batched(
 
     K = env.num_slots
     N = n_rollouts
+    H = agent.cfg.belief_dim
 
     beliefs_K = env.beliefs[:K].to(device)
     priors_K = env.priors[:K].to(device)
     bnd = env.boundaries[:K].to(device)
-    distortions_K = (env.distortions[:K].to(device) if env.distortions is not None else None)
+
+    distortions_K = (
+        env.distortion_vectors[:K].to(device)  # (K, H)
+        if env.distortion_vectors is not None
+        else None
+    )
 
     durations = (bnd[:, 1] - bnd[:, 0]).float().clamp(min=1.0).log()
     rel_pos = torch.arange(K, device=device).float() / max(K - 1, 1)
@@ -541,11 +632,13 @@ def collect_episodes_batched(
     steps_since = torch.zeros(N, device=device)
     gt_idx_v = [0] * N
     emit_slots: List[List[int]] = [[] for _ in range(N)]
+    prev_actions = torch.zeros(N, dtype=torch.long, device=device)
 
     s_beliefs: List[torch.Tensor] = []
     s_priors: List[torch.Tensor] = []
     s_syl_feats: List[torch.Tensor] = []
     s_errors: List[Optional[torch.Tensor]] = []
+    s_prev_actions: List[torch.Tensor] = []
     s_actions: List[torch.Tensor] = []
     s_log_probs: List[torch.Tensor] = []
     s_values: List[torch.Tensor] = []
@@ -558,10 +651,16 @@ def collect_episodes_batched(
         b_t = beliefs_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
         p_t = priors_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
         s_t = syl_feat_t.unsqueeze(1)
-        d_t = (distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
-               if distortions_K is not None else torch.zeros(N, 1, 1, device=device))
 
-        logits_t, values_t, hidden = agent(b_t, p_t, s_t, d_t, hidden)
+        d_t = (
+            distortions_K[t].unsqueeze(0).expand(N, -1).unsqueeze(1)
+            if distortions_K is not None
+            else torch.zeros(N, 1, H, device=device)
+        )
+
+        prev_act_t = prev_actions.unsqueeze(1)
+
+        logits_t, values_t, hidden = agent(b_t, p_t, s_t, d_t, hidden, prev_act_t)
         logits_sq = logits_t.squeeze(1)
         sample_dist = torch.distributions.Categorical(logits=logits_sq / temperature)
         actions_t = sample_dist.sample()
@@ -583,6 +682,11 @@ def collect_episodes_batched(
             else:
                 if cfg.reward_mode == "per_slot":
                     r = cfg.wait_penalty
+                # POMDP: info gain reward for WAIT.
+                if cfg.info_gain_scale > 0.0 and distortions_K is not None and t + 1 < K:
+                    d_now = distortions_K[t].norm().item()
+                    d_next = distortions_K[t + 1].norm().item()
+                    r += cfg.info_gain_scale * max(0.0, d_now - d_next)
 
             if is_last:
                 if cfg.reward_mode == "episode_f1":
@@ -608,11 +712,14 @@ def collect_episodes_batched(
         s_priors.append(priors_K[t].cpu())
         s_syl_feats.append(syl_feat_t.cpu())
         s_errors.append(distortions_K[t].cpu() if distortions_K is not None else None)
+        s_prev_actions.append(prev_actions.cpu())
         s_actions.append(actions_t.cpu())
         s_log_probs.append(log_probs_t.cpu())
         s_values.append(values_t.squeeze(-1).squeeze(-1).cpu())
         for n in range(N):
             s_rewards[n].append(rewards_step[n])
+
+        prev_actions = actions_t.clone()
 
     buffers: List[EpisodeBuffer] = []
     for n in range(N):
@@ -628,14 +735,50 @@ def collect_episodes_batched(
                 value=s_values[t][n].item(),
                 reward=s_rewards[n][t],
                 error=err_t,
+                prev_action=s_prev_actions[t][n].item(),
             ))
         buffers.append(buf)
     return buffers
 
 
 # ---------------------------------------------------------------------------
-# GRPO update
+# GAE + GRPO update
 # ---------------------------------------------------------------------------
+
+
+def compute_gae(
+    rewards: List[float],
+    values: List[float],
+    gamma: float = 0.99,
+    lam: float = 0.95,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-step Generalized Advantage Estimates and n-step returns.
+
+    GAE (Schulman et al. 2016) interpolates between high-variance Monte Carlo
+    returns (lam=1) and low-variance TD(0) (lam=0).  lam=0.95 is a well-tuned
+    default that provides strong variance reduction while preserving enough
+    multi-step context for credit assignment in sparse-reward problems.
+
+    Args:
+        rewards: Step rewards [r_0, ..., r_{T-1}].
+        values:  Per-step value predictions [V_0, ..., V_{T-1}].
+        gamma:   Discount factor (default 0.99).
+        lam:     GAE lambda (default 0.95).
+
+    Returns:
+        advantages: (T,) per-step advantage estimates A_t.
+        returns:    (T,) n-step returns = A_t + V_t (value training targets).
+    """
+    T = len(rewards)
+    adv = torch.zeros(T)
+    gae = 0.0
+    for t in reversed(range(T)):
+        next_val = values[t + 1] if t + 1 < T else 0.0
+        delta = rewards[t] + gamma * next_val - values[t]
+        gae = delta + gamma * lam * gae
+        adv[t] = gae
+    returns = adv + torch.tensor(values, dtype=torch.float32)
+    return adv, returns
 
 
 def grpo_update(
@@ -646,18 +789,32 @@ def grpo_update(
     clip_eps: float = 0.2,
     entropy_coef: float = 0.02,
     grpo_mini_epochs: int = 1,
+    gamma: float = 0.99,
+    lam: float = 0.95,
+    value_coef: float = 0.5,
 ) -> Dict[str, float]:
-    """Group Relative Policy Optimization (GRPO).
+    """GRPO with per-step GAE advantage estimation.
 
     Each element of *groups* is G episodes from the **same** utterance.
-    Episode-level rewards are normalised within the group to yield a
-    group-relative advantage, then used as a clipped REINFORCE signal
-    applied to every transition.  No value-function critic needed.
+    Per-step advantages are computed via GAE using the stored value predictions,
+    then group-normalised (group-relative) to remove utterance-level difficulty
+    bias. A value function loss (MSE to GAE returns) trains the critic.
+
+    Compared to episode-level GRPO, per-step GAE:
+      - Assigns credit correctly to individual WAIT/EMIT decisions.
+      - Uses the value baseline to reduce advantage variance at every step.
+      - Handles long sequences with sparse rewards more gracefully.
+
+    Args:
+        gamma:      Discount factor for future rewards.
+        lam:        GAE lambda (0 = TD(0), 1 = Monte Carlo).
+        value_coef: Coefficient for value function loss relative to policy loss.
     """
     if not groups:
-        return {"policy_loss": 0.0, "entropy": 0.0}
+        return {"policy_loss": 0.0, "entropy": 0.0, "value_loss": 0.0}
 
     total_policy_loss = 0.0
+    total_value_loss = 0.0
     total_entropy = 0.0
     n_updates = 0
 
@@ -670,17 +827,33 @@ def grpo_update(
             if G == 0:
                 continue
 
-            ep_rewards = [sum(t.reward for t in ep.transitions) for ep in group]
-            r_mean = sum(ep_rewards) / G
-            r_std = math.sqrt(sum((r - r_mean) ** 2 for r in ep_rewards) / max(G - 1, 1)) + 1e-8
+            # Step 1: Compute per-step GAE advantages for every episode.
+            all_advs: List[torch.Tensor] = []
+            all_returns: List[torch.Tensor] = []
+            for ep in group:
+                rewards = [t.reward for t in ep.transitions]
+                values = [t.value for t in ep.transitions]
+                ep_advs, ep_returns = compute_gae(rewards, values, gamma, lam)
+                all_advs.append(ep_advs)
+                all_returns.append(ep_returns)
+
+            # Step 2: Group-relative normalisation of per-step advantages.
+            # Subtracting the group mean removes utterance-level difficulty bias;
+            # dividing by std keeps gradients well-scaled.
+            all_advs_cat = torch.cat(all_advs)
+            adv_mean = all_advs_cat.mean()
+            adv_std = all_advs_cat.std() + 1e-8
 
             optimizer.zero_grad()
             group_policy_loss = 0.0
+            group_value_loss = 0.0
 
-            for ep, ep_reward in zip(group, ep_rewards):
+            for ep, ep_advs, ep_returns in zip(group, all_advs, all_returns):
                 if len(ep.transitions) == 0:
                     continue
-                adv = (ep_reward - r_mean) / r_std
+
+                normed_advs = ((ep_advs - adv_mean) / adv_std).to(device)
+                ep_returns = ep_returns.to(device)
 
                 b = torch.stack([t.belief for t in ep.transitions]).unsqueeze(0).to(device)
                 p = torch.stack([t.prior for t in ep.transitions]).unsqueeze(0).to(device)
@@ -689,12 +862,20 @@ def grpo_update(
                 old_lp = torch.tensor([t.log_prob for t in ep.transitions], dtype=torch.float32, device=device)
 
                 _e_list = [t.error for t in ep.transitions]
-                err = (torch.stack(_e_list).unsqueeze(0).to(device)
-                       if _e_list[0] is not None
-                       else torch.zeros(1, b.shape[1], 1, device=device))
+                H = agent.cfg.belief_dim
+                err = (
+                    torch.stack(_e_list).unsqueeze(0).to(device)
+                    if _e_list[0] is not None
+                    else torch.zeros(1, b.shape[1], H, device=device)
+                )
 
-                logits, _, _ = agent(b, p, s, err)
-                logits = logits.squeeze(0)
+                _pa_list = [t.prev_action if t.prev_action is not None else WAIT
+                            for t in ep.transitions]
+                prev_act = torch.tensor(_pa_list, dtype=torch.long, device=device).unsqueeze(0)
+
+                logits, value_preds, _ = agent(b, p, s, err, prev_action=prev_act)
+                logits = logits.squeeze(0)           # (T, 2)
+                value_preds = value_preds.squeeze()  # (T,) or scalar if T=1
 
                 dist_p = torch.distributions.Categorical(logits=logits)
                 new_lp = dist_p.log_prob(a)
@@ -702,26 +883,31 @@ def grpo_update(
 
                 if clip_eps > 0.0:
                     ratio = (new_lp - old_lp).exp()
-                    surr1 = ratio * adv
-                    surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * adv
+                    surr1 = ratio * normed_advs
+                    surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * normed_advs
                     p_loss = -torch.min(surr1, surr2).mean()
                 else:
-                    p_loss = -(new_lp * adv).mean()
+                    p_loss = -(new_lp * normed_advs).mean()
 
-                loss = (p_loss - entropy_coef * ent) / G
+                v_loss = F.mse_loss(value_preds.view(-1), ep_returns.view(-1))
+
+                loss = (p_loss + value_coef * v_loss - entropy_coef * ent) / G
                 loss.backward()
 
                 group_policy_loss += p_loss.item()
+                group_value_loss += v_loss.item()
                 total_entropy += ent.item() / G
 
             nn.utils.clip_grad_norm_(agent.parameters(), 5.0)
             optimizer.step()
 
             total_policy_loss += group_policy_loss / max(G, 1)
+            total_value_loss += group_value_loss / max(G, 1)
             n_updates += 1
 
     n_updates = max(n_updates, 1)
     return {
         "policy_loss": total_policy_loss / n_updates,
+        "value_loss": total_value_loss / n_updates,
         "entropy": total_entropy / n_updates,
     }

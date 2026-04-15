@@ -2,7 +2,8 @@
 
 Two-phase training:
   Phase 1 — Imitation Learning (IL):  cross-entropy on oracle emit labels.
-  Phase 2 — GRPO fine-tuning:         on-policy rollouts with word-level reward.
+  Phase 2 — GRPO+GAE fine-tuning:     on-policy rollouts with word-level reward
+                                        and per-step GAE advantage estimation.
 
 Single-GPU:
     python train_agent.py --phase il ...
@@ -124,6 +125,37 @@ def build_syl_features_batch(
     return torch.stack([log_dur, rel_pos, steps_since], dim=-1)
 
 
+def build_prev_actions_batch(oracle_emit: torch.Tensor) -> torch.Tensor:
+    """Causal previous-action tensor from oracle labels (B, K) → (B, K) int64.
+
+    prev_actions[b, k] = oracle_emit[b, k-1] (shifted right, zero-padded).
+    This gives the agent the oracle action from the previous step during IL
+    training, implementing T(s'|s,a) conditioning without label leakage.
+    """
+    B, K = oracle_emit.shape
+    device = oracle_emit.device
+    return torch.cat([
+        torch.zeros(B, 1, device=device, dtype=torch.long),
+        oracle_emit[:, :-1].long(),
+    ], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Entropy annealing
+# ---------------------------------------------------------------------------
+
+
+def cosine_entropy_coef(epoch: int, total: int, start: float, end: float) -> float:
+    """Cosine anneal entropy coefficient: high exploration early, focus later.
+
+    Returns `start` at epoch=0 and approaches `end` at epoch=total.
+    If start == end the coefficient is constant (no annealing).
+    """
+    if start == end:
+        return start
+    return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * epoch / max(total, 1)))
+
+
 # ---------------------------------------------------------------------------
 # Imitation Learning
 # ---------------------------------------------------------------------------
@@ -161,18 +193,20 @@ def train_il_epoch(
         boundaries = batch["boundaries"].to(device)
         num_slots = batch["num_slots"].to(device)
 
-        # steps_since is computed from oracle history STRICTLY BEFORE position k
-        # (see compute_steps_since_emit — cummax is shifted by 1 to exclude the
-        # current position, so oracle[k]=1 does NOT set steps_since[k]=0).
-        # This is a causal temporal feature with no label leakage.  At rollout
-        # the agent substitutes its own emit history, which closely matches oracle
-        # given the ~99% recall achieved by IL.
         syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)
-        distortions = batch["distortions"].to(device) if "distortions" in batch else None
-        err = (distortions if distortions is not None
-               else torch.zeros(beliefs.shape[0], beliefs.shape[1], 1, device=device))
 
-        logits, _values, _ = agent(beliefs, priors, syl_feats, err)
+        # Distortion vectors: (B, K, H). Fall back to zeros if not available.
+        if "distortion_vectors" in batch:
+            err = batch["distortion_vectors"].to(device)
+        else:
+            B, K = beliefs.shape[:2]
+            err = torch.zeros(B, K, beliefs.shape[-1], device=device)
+
+        # Causal previous-action conditioning: oracle actions shifted by 1.
+        prev_actions = build_prev_actions_batch(oracle)
+
+        raw = agent.module if isinstance(agent, DDP) else agent
+        logits, _values, _ = agent(beliefs, priors, syl_feats, err, prev_action=prev_actions)
 
         actions = oracle.long()
         loss_per_token = F.cross_entropy(
@@ -183,7 +217,6 @@ def train_il_epoch(
 
         optimizer.zero_grad()
         loss.backward()
-        raw = agent.module if isinstance(agent, DDP) else agent
         nn.utils.clip_grad_norm_(raw.parameters(), 5.0)
         optimizer.step()
 
@@ -223,56 +256,25 @@ def train_il_epoch(
 
 
 @torch.no_grad()
-def eval_il(
-    agent: nn.Module,
-    loader: DataLoader,
+def eval_il_rollout(
+    agent: ActiveAgent,
+    val_ds: AgentDataset,
+    phone_vocab: Vocabulary,
     device: torch.device,
-    world_size: int = 1,
-    show_progress: bool = True,
+    max_episodes: int = 50,
 ) -> Dict[str, float]:
-    agent.eval()
-    total_correct = torch.tensor(0, device=device)
-    total_samples = torch.tensor(0, device=device)
-    total_emit_tp = torch.tensor(0, device=device)
-    total_emit_pos = torch.tensor(0, device=device)
-    total_emit_pred = torch.tensor(0, device=device)
+    """True rollout evaluation during IL — exposes the oracle→rollout F1 gap.
 
-    for batch in tqdm(loader, desc="  eval", unit="batch",
-                      disable=not show_progress, dynamic_ncols=True, leave=False):
-        beliefs = batch["beliefs"].to(device)
-        priors = batch["priors"].to(device)
-        slot_mask = batch["slot_mask"].to(device)
-        oracle = batch["oracle_emit"].to(device)
-        boundaries = batch["boundaries"].to(device)
-        num_slots = batch["num_slots"].to(device)
-
-        syl_feats = build_syl_features_batch(boundaries, num_slots, oracle)
-        distortions = batch["distortions"].to(device) if "distortions" in batch else None
-        err = (distortions if distortions is not None
-               else torch.zeros(beliefs.shape[0], beliefs.shape[1], 1, device=device))
-
-        logits, _, _ = agent(beliefs, priors, syl_feats, err)
-        preds = logits.argmax(dim=-1).float()
-        mask = slot_mask.bool()
-        total_correct += ((preds == oracle) & mask).sum()
-        total_samples += mask.sum()
-        total_emit_tp += ((preds == 1) & (oracle == 1) & mask).sum()
-        total_emit_pos += (oracle == 1).sum()
-        total_emit_pred += ((preds == 1) & mask).sum()
-
-    if world_size > 1:
-        for t in [total_correct, total_samples, total_emit_tp, total_emit_pos, total_emit_pred]:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-    recall = total_emit_tp.item() / max(total_emit_pos.item(), 1)
-    precision = total_emit_tp.item() / max(total_emit_pred.item(), 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-    return {
-        "val_acc": total_correct.item() / max(total_samples.item(), 1),
-        "val_emit_recall": recall,
-        "val_emit_precision": precision,
-        "val_emit_f1": f1,
-    }
+    Uses per_slot reward mode with no wait penalty to measure pure slot-matching
+    F1 under the same rollout protocol as GRPO evaluation.  This is the only
+    validation metric used for IL checkpoint saving, avoiding the inflated
+    F1 that comes from batch oracle evaluation.
+    """
+    rollout_env_cfg = EnvConfig(reward_mode="per_slot", wait_penalty=0.0)
+    return evaluate_agent(
+        agent, val_ds, phone_vocab, device, rollout_env_cfg,
+        max_episodes=max_episodes,
+    )
 
 
 @torch.no_grad()
@@ -316,7 +318,7 @@ def evaluate_agent(
             env_cfg=env_cfg,
             oracle_emit=record.get("oracle_emit"),
             word_phones_list=record.get("word_phone_ids"),
-            distortions=record.get("distortions"),
+            distortion_vectors=record.get("distortion_vectors"),
         )
 
         word_phone_ids = record.get("word_phone_ids") or []
@@ -386,16 +388,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--il-batch-size", type=int, default=32)
     p.add_argument("--il-pos-weight", type=float, default=4.0)
     p.add_argument("--oracle-min-gap", type=int, default=2)
+    # IL rollout evaluation — the only IL validation metric (avoids oracle F1 inflation)
+    p.add_argument("--rollout-eval-every", type=int, default=5,
+                   help="Run true rollout eval every N IL epochs (0 = disabled). "
+                        "Rollout F1 is the sole checkpoint criterion — batch oracle eval "
+                        "is not used as it gives artificially high F1 (~0.93 vs ~0.73 rollout).")
+    p.add_argument("--rollout-eval-episodes", type=int, default=50,
+                   help="Number of val episodes for IL rollout eval.")
 
-    # GRPO
-    p.add_argument("--grpo-epochs", type=int, default=150)
+    # GRPO + GAE
+    p.add_argument("--grpo-epochs", type=int, default=200)
     p.add_argument("--grpo-lr", type=float, default=1e-4)
     p.add_argument("--grpo-utterances-per-update", type=int, default=32)
     p.add_argument("--grpo-rollouts", type=int, default=8)
     p.add_argument("--grpo-clip-eps", type=float, default=0.2)
-    p.add_argument("--grpo-entropy-coef", type=float, default=0.02)
+    p.add_argument("--grpo-entropy-coef", type=float, default=0.02,
+                   help="Starting entropy coefficient (high = more exploration).")
+    p.add_argument("--grpo-entropy-coef-end", type=float, default=None,
+                   help="Ending entropy coefficient for cosine annealing. "
+                        "Defaults to --grpo-entropy-coef (constant).")
     p.add_argument("--grpo-mini-epochs", type=int, default=1)
     p.add_argument("--rollout-temperature", type=float, default=1.0)
+    # GAE parameters
+    p.add_argument("--gae-gamma", type=float, default=0.99,
+                   help="Discount factor for GAE (default 0.99).")
+    p.add_argument("--gae-lambda", type=float, default=0.95,
+                   help="GAE lambda: 0=TD(0) (low var, high bias), "
+                        "1=MC (high var, low bias). Default 0.95.")
+    p.add_argument("--value-coef", type=float, default=0.5,
+                   help="Coefficient for value function MSE loss.")
 
     # Environment
     p.add_argument("--wait-penalty", type=float, default=-0.01)
@@ -407,6 +428,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--f1-reward-scale", type=float, default=1.0)
     p.add_argument("--f1-match-window", type=int, default=0)
     p.add_argument("--missing-word-penalty", type=float, default=0.5)
+    p.add_argument("--info-gain-scale", type=float, default=0.0,
+                   help="Scale factor for WAIT information-gain reward: "
+                        "WAIT is rewarded proportionally to distortion norm decrease "
+                        "at the next slot (POMDP information-gathering principle).")
 
     # General
     p.add_argument("--lr", type=float, default=None)
@@ -415,7 +440,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-preload", action="store_true")
     p.add_argument("--max-train-examples", type=int, default=None)
     p.add_argument("--max-val-examples", type=int, default=None)
-    p.add_argument("--eval-every", type=int, default=5)
+    p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--resume-from", type=str, default=None)
@@ -514,6 +539,14 @@ def main() -> None:
     else:
         agent = agent_raw
 
+    # Resolve entropy annealing endpoints.
+    entropy_coef_start = args.grpo_entropy_coef
+    entropy_coef_end = (
+        args.grpo_entropy_coef_end
+        if args.grpo_entropy_coef_end is not None
+        else args.grpo_entropy_coef
+    )
+
     env_cfg = EnvConfig(
         wait_penalty=args.wait_penalty,
         correct_reward=args.correct_reward,
@@ -523,10 +556,15 @@ def main() -> None:
         f1_reward_scale=args.f1_reward_scale,
         f1_match_window=args.f1_match_window,
         missing_word_penalty=args.missing_word_penalty,
+        info_gain_scale=args.info_gain_scale,
     )
 
     if is_main(rank):
         print(f"Agent parameters: {sum(p.numel() for p in agent_raw.parameters() if p.requires_grad):,}")
+        print(f"  belief_dim={cfg.belief_dim}, agent_hidden={cfg.agent_hidden}")
+        print(f"  entropy_coef: {entropy_coef_start} → {entropy_coef_end} "
+              f"({'cosine anneal' if entropy_coef_start != entropy_coef_end else 'constant'})")
+        print(f"  GAE: gamma={args.gae_gamma}, lambda={args.gae_lambda}, value_coef={args.value_coef}")
 
     run_il = args.phase in ("il", "both")
     run_grpo = args.phase in ("grpo", "both")
@@ -542,8 +580,10 @@ def main() -> None:
         optimizer = AdamW(agent_raw.parameters(), lr=il_lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.il_epochs, eta_min=il_lr * 0.01)
 
-        best_f1 = 0.0
+        best_rollout_f1 = 0.0
         history_il: list[dict] = []
+
+        do_rollout_eval = (args.rollout_eval_every > 0) and is_main(rank)
 
         for epoch in range(1, args.il_epochs + 1):
             if train_sampler is not None:
@@ -555,38 +595,51 @@ def main() -> None:
             )
             scheduler.step()
 
-            if epoch % args.eval_every == 0 or epoch == args.il_epochs:
-                val_metrics = eval_il(agent, val_loader, device, world_size=world_size, show_progress=is_main(rank))
-                if is_main(rank):
-                    record = {"epoch": epoch, **train_metrics, **val_metrics, "lr": optimizer.param_groups[0]["lr"]}
-                    history_il.append(record)
-                    print(json.dumps(record, ensure_ascii=True), flush=True)
-                    ckpt = {"agent_state_dict": agent_raw.state_dict(), "agent_config": cfg, "epoch": epoch, "history": history_il}
+            if is_main(rank):
+                record: dict = {"epoch": epoch, **train_metrics, "lr": optimizer.param_groups[0]["lr"]}
+
+                # Rollout eval: true validation F1 under rollout protocol.
+                if do_rollout_eval and (epoch % args.rollout_eval_every == 0 or epoch == args.il_epochs):
+                    rollout_metrics = eval_il_rollout(
+                        agent_raw, val_ds, phone_vocab, device,
+                        max_episodes=args.rollout_eval_episodes,
+                    )
+                    record.update({f"val_{k}": v for k, v in rollout_metrics.items()})
+                    rollout_f1 = rollout_metrics.get("f1", 0.0)
+
+                    ckpt = {
+                        "agent_state_dict": agent_raw.state_dict(),
+                        "agent_config": cfg,
+                        "epoch": epoch,
+                        "history": history_il,
+                    }
                     torch.save(ckpt, output_dir / "il_last.pt")
-                    if val_metrics["val_emit_f1"] > best_f1:
-                        best_f1 = val_metrics["val_emit_f1"]
+
+                    if rollout_f1 > best_rollout_f1:
+                        best_rollout_f1 = rollout_f1
                         torch.save(ckpt, output_dir / "il_best.pt")
-                        print(f"  New best F1: {best_f1:.4f}")
-            elif epoch % args.log_every == 0 and is_main(rank):
-                print(json.dumps({"epoch": epoch, **train_metrics, "lr": optimizer.param_groups[0]["lr"]}), flush=True)
+                        print(f"  New best rollout F1: {best_rollout_f1:.4f}")
+
+                history_il.append(record)
+                print(json.dumps(record, ensure_ascii=True), flush=True)
 
         if is_main(rank):
-            print(f"IL complete. Best val F1: {best_f1:.4f}")
+            print(f"IL complete. Best rollout F1: {best_rollout_f1:.4f}")
 
     # ------------------------------------------------------------------
-    # Phase 2: GRPO Fine-tuning
+    # Phase 2: GRPO + GAE Fine-tuning
     # ------------------------------------------------------------------
     if run_grpo:
         if is_main(rank):
-            print(f"\n{'=' * 60}\nPhase 2: GRPO  (world_size={world_size})\n{'=' * 60}")
+            print(f"\n{'=' * 60}\nPhase 2: GRPO+GAE  (world_size={world_size})\n{'=' * 60}")
 
         if run_il and not args.resume_from:
-            best_il = output_dir / "il_best.pt"
-            if best_il.exists():
-                ckpt = torch.load(best_il, map_location="cpu", weights_only=False)
+            best_il_path = output_dir / "il_best.pt"
+            if best_il_path.exists():
+                ckpt = torch.load(best_il_path, map_location="cpu", weights_only=False)
                 agent_raw.load_state_dict(ckpt["agent_state_dict"])
                 if is_main(rank):
-                    print("Starting GRPO from IL best checkpoint")
+                    print(f"Starting GRPO from il_best.pt (rollout F1 checkpoint)")
 
         if world_size > 1:
             for param in agent_raw.parameters():
@@ -599,13 +652,19 @@ def main() -> None:
         )
 
         best_f1 = -float("inf")
+        best_word_acc = -float("inf")
         history_grpo: list[dict] = []
         all_indices = list(range(len(train_ds)))
 
-        epoch_pbar = tqdm(range(1, args.grpo_epochs + 1), desc="GRPO", unit="epoch",
+        epoch_pbar = tqdm(range(1, args.grpo_epochs + 1), desc="GRPO+GAE", unit="epoch",
                           disable=not is_main(rank), dynamic_ncols=True)
 
         for epoch in epoch_pbar:
+            # Cosine entropy annealing.
+            current_entropy_coef = cosine_entropy_coef(
+                epoch - 1, args.grpo_epochs, entropy_coef_start, entropy_coef_end,
+            )
+
             rng = random.Random(args.seed + epoch * 1000 + rank)
             rng.shuffle(all_indices)
             utt_indices = all_indices[:args.grpo_utterances_per_update]
@@ -632,7 +691,7 @@ def main() -> None:
                     env_cfg=env_cfg,
                     oracle_emit=record.get("oracle_emit"),
                     word_phones_list=record.get("word_phone_ids"),
-                    distortions=record.get("distortions"),
+                    distortion_vectors=record.get("distortion_vectors"),
                 )
                 group_episodes = collect_episodes_batched(
                     agent_raw, env, device, args.grpo_rollouts,
@@ -648,8 +707,11 @@ def main() -> None:
             update_metrics = grpo_update(
                 agent_raw, optimizer, groups, device,
                 clip_eps=args.grpo_clip_eps,
-                entropy_coef=args.grpo_entropy_coef,
+                entropy_coef=current_entropy_coef,
                 grpo_mini_epochs=args.grpo_mini_epochs,
+                gamma=args.gae_gamma,
+                lam=args.gae_lambda,
+                value_coef=args.value_coef,
             )
 
             if world_size > 1:
@@ -668,7 +730,9 @@ def main() -> None:
                 epoch_pbar.set_postfix(
                     r=f"{avg_reward:.3f}",
                     pl=f"{update_metrics.get('policy_loss', 0):.4f}",
+                    vl=f"{update_metrics.get('value_loss', 0):.4f}",
                     ent=f"{update_metrics.get('entropy', 0):.3f}",
+                    ec=f"{current_entropy_coef:.4f}",
                     emit=f"{emit_ratio:.2f}",
                 )
 
@@ -677,31 +741,50 @@ def main() -> None:
                     val_metrics = evaluate_agent(agent_raw, val_ds, phone_vocab, device, env_cfg,
                                                  max_episodes=min(200, len(val_ds)))
                     record = {
-                        "epoch": epoch, "train_avg_reward": avg_reward, "train_emit_ratio": emit_ratio,
-                        **update_metrics, **{f"val_{k}": v for k, v in val_metrics.items()},
+                        "epoch": epoch,
+                        "train_avg_reward": avg_reward,
+                        "train_emit_ratio": emit_ratio,
+                        "entropy_coef": current_entropy_coef,
+                        **update_metrics,
+                        **{f"val_{k}": v for k, v in val_metrics.items()},
                         "lr": optimizer.param_groups[0]["lr"],
                     }
                     history_grpo.append(record)
                     print(json.dumps(record, ensure_ascii=True), flush=True)
+
                     ckpt = {"agent_state_dict": agent_raw.state_dict(), "agent_config": cfg,
                             "env_config": env_cfg, "epoch": epoch, "history": history_grpo}
                     torch.save(ckpt, output_dir / "grpo_last.pt")
+
                     val_f1 = val_metrics.get("f1", 0.0)
+                    val_word_acc = val_metrics.get("word_acc", 0.0)
+
+                    # Best slot-matching F1 checkpoint (slot timing alignment).
                     if val_f1 > best_f1:
                         best_f1 = val_f1
                         torch.save(ckpt, output_dir / "grpo_best.pt")
-                        word_acc_str = (f" word_acc={val_metrics.get('word_acc', 0):.3f}"
-                                        if env_cfg.reward_mode == "word_match" else "")
                         print(f"  New best F1: {best_f1:.4f} "
                               f"(prec={val_metrics.get('precision', 0):.3f} "
-                              f"rec={val_metrics.get('recall', 0):.3f}){word_acc_str}")
+                              f"rec={val_metrics.get('recall', 0):.3f})")
+
+                    # Best ASR word accuracy checkpoint (primary GRPO objective).
+                    if val_word_acc > best_word_acc:
+                        best_word_acc = val_word_acc
+                        torch.save(ckpt, output_dir / "grpo_best_workacc.pt")
+                        print(f"  New best word_acc: {best_word_acc:.4f} "
+                              f"(f1={val_f1:.4f})")
+
             elif epoch % args.log_every == 0 and is_main(rank):
-                print(json.dumps({"epoch": epoch, "train_avg_reward": avg_reward,
-                                  "train_emit_ratio": emit_ratio, **update_metrics,
-                                  "lr": optimizer.param_groups[0]["lr"]}), flush=True)
+                print(json.dumps({
+                    "epoch": epoch, "train_avg_reward": avg_reward,
+                    "train_emit_ratio": emit_ratio,
+                    "entropy_coef": current_entropy_coef,
+                    **update_metrics,
+                    "lr": optimizer.param_groups[0]["lr"],
+                }), flush=True)
 
         if is_main(rank):
-            print(f"GRPO complete. Best val F1: {best_f1:.4f}")
+            print(f"GRPO+GAE complete. Best F1: {best_f1:.4f}  Best word_acc: {best_word_acc:.4f}")
 
     if is_main(rank):
         print(f"\nTraining complete → {output_dir}")

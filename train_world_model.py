@@ -95,6 +95,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sigreg-projections", type=int, default=64)
     p.add_argument("--diversity-weight", type=float, default=0.0)
     p.add_argument("--diversity-hinge", type=float, default=0.8)
+    p.add_argument("--belief-var-weight", type=float, default=0.0,
+                   help="Weight for KL divergence loss on belief distribution "
+                        "(POMDP VAE extension, 0.0 = disabled). Recommended: 0.01-0.1.")
 
     # Training
     p.add_argument("--batch-size", type=int, default=64)
@@ -294,6 +297,16 @@ class WorldModelLitModule(pl.LightningModule):
             loss_dict["convergence_loss"] = conv_loss
             loss_dict["loss"] = loss_dict["loss"] + conv_weight * conv_loss
 
+        # POMDP belief variance: KL[ q(belief|slots) || p(belief|prior) ].
+        # Enabled when belief_var_weight > 0 (requires WorldModelConfig.belief_var_weight > 0).
+        belief_var_weight = getattr(self.args, "belief_var_weight", 0.0)
+        if belief_var_weight > 0 and "belief_logvar" in outputs:
+            kl_loss = self.model.belief_kl_loss(
+                outputs["beliefs"], outputs["priors"], outputs["belief_logvar"], sm
+            )
+            loss_dict["belief_kl_loss"] = kl_loss
+            loss_dict["loss"] = loss_dict["loss"] + belief_var_weight * kl_loss
+
         return loss_dict
 
     def training_step(self, batch, batch_idx):
@@ -414,7 +427,7 @@ class JSONLogCallback(Callback):
             "recon": float(m.get("train_recon_loss_step", 0)),
             "lr": trainer.optimizers[0].param_groups[0]["lr"],
         }
-        for extra in ("sigreg_loss", "convergence_loss", "diversity_loss"):
+        for extra in ("sigreg_loss", "convergence_loss", "diversity_loss", "belief_kl_loss"):
             key = f"train_{extra}_step"
             if key in m:
                 log_dict[extra] = float(m[key])
@@ -461,6 +474,7 @@ def main() -> None:
         belief_grad_scale=args.belief_grad_scale,
         frame_phone_dropout=args.frame_phone_dropout,
         canonical_head_dropout=args.canonical_head_dropout,
+        belief_var_weight=args.belief_var_weight,
     )
 
     dm = BeliefWMDataModule(args, phone_vocab, text_vocab, _maybe_teacher_cache(args))

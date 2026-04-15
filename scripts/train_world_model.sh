@@ -25,4 +25,5 @@ torchrun --nproc_per_node=$N --master_port=$PORT train_world_model.py \
     --convergence-loss-weight 0.2 --sigreg-weight 0.05 \
     --diversity-weight 0.1 --diversity-hinge 0.8 \
     --eval-every-epochs 5 --log-every-steps 10 \
-    --num-workers 4 --seed 42 --patience 30
+    --num-workers 4 --seed 42 --patience 30 \
+    --resume-from   /data/bixingwu/runs/wm_v4/last.pt
