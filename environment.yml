@@ -1,0 +1,18 @@
+name: huperwm
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+    - torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+    - lightning==2.6.1
+    - transformers==5.3.0
+    - datasets==4.8.4
+    - numpy==2.4.3
+    - soundfile==0.13.1
+    - nltk==3.9.4
+    - g2p-en==2.1.0
+    - sylber==0.1.4
