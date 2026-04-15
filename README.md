@@ -14,7 +14,7 @@ The pipeline has two stages:
 
 2. **Active Agent** — a dual-pathway (top-down belief / bottom-up prior+GRU) policy that outputs WAIT / EMIT at each syllable slot. Trained first with imitation learning on oracle labels, then fine-tuned with GRPO + per-step GAE.
 
-![Agent pipeline](image/agentpipeline.png)
+![Agent pipeline](image/briefpipeline.png)
 
 ---
 
